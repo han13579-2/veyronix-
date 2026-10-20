@@ -1,2 +1,1 @@
-# veyronix-
-drill earth core
+loadstring(game:HttpGet("https://raw.githubusercontent.com/drill-earth-core/main/veyronix.lua"))()
