@@ -1,1 +1,4195 @@
-loadstring(game:HttpGet("https://raw.githubusercontent.com/drill-earth-core/main/veyronix.lua"))()
+-- Ore Farm v6.2 | Rayfield Gen2 | label: ore-farm
+-- v6: dil secimi (TR/EN), Hareket sekmesi (ucma/sinirsiz ziplama/noclip/god + tus atama + mobil butonlar),
+--     Tarama sekmesi, havada kilitli float (cevher kirilinca dusmez), boru hatli hizli toplama.
+-- v5.2 degisiklikleri (canli testlerle):
+--  * World tarayici: Workspace'in TUM alt dallarini surekli izler (DescendantAdded + periyodik tarama).
+--    Cevher = SessionOreType ozelligi olan her sey, Esya = ItemDatabaseId/ItemDatabaseTemplate olan her sey.
+--    Workspace:FindFirstChild("Items"/"Ores") artik bu tarayiciyi dondurur -> kodun tamami tum dallari gorur.
+--  * RequestStreamAroundAsync HICBIR ZAMAN geri donmuyor -> ates-et-unut (pulse) + 4sn sonra thread iptal.
+--    Yuklu kalma suresi ~3-5sn, istek yaricapi ~400 stud -> surekli tekrar, ayni anda cok konum.
+--  * Zindan 3B izgara: kuzey kapilar (+z), guney kapilar (-z) yonune ~2000 stud, SpiderPit y=600'e kadar.
+--  * Yol boyunca +-2000 z seritleri taranir.
+--  * Toplama: canta aktif degilse yeniden aktif eder, dolunca drill'e bosaltir, uzaktan olmazsa yanina isinlanir.
+--  * Cevher hafizasi: bulunan her cevher hatirlanir, siradaki cevhere surekli gider.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ===== Workspace vekili: Items/Ores -> World tarayicisi (tum alt dallar) =====
+local RealWorkspace = game:GetService("Workspace")
+local World = { items = {}, ores = {}, corpses = {} }
+local function listOf(set)
+	local t = {}
+	for d in pairs(set) do
+		if d.Parent then
+			t[#t + 1] = d
+		else
+			set[d] = nil
+		end
+	end
+	return t
+end
+local ItemsView = { GetChildren = function()
+	return listOf(World.items)
+end }
+local OresView = { GetChildren = function()
+	return listOf(World.ores)
+end }
+local Workspace = setmetatable({}, {
+	__index = function(_, k)
+		local v = RealWorkspace[k]
+		if type(v) == "function" then
+			return function(_, ...)
+				if k == "FindFirstChild" then
+					local n = ...
+					if n == "Items" then
+						return ItemsView
+					end
+					if n == "Ores" then
+						return OresView
+					end
+				end
+				return v(RealWorkspace, ...)
+			end
+		end
+		return v
+	end,
+})
+
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local LocalPlayer = Players.LocalPlayer
+
+local UserInputService = game:GetService("UserInputService")
+
+-- ===== Dil / Language (kaynak metinler Turkce; Ingilizce sozluk asagida) =====
+local SETTINGS_DIR = "OreFarm"
+local LANG_FILE = SETTINGS_DIR .. "/lang.txt"
+local KEYS_FILE = SETTINGS_DIR .. "/keys.json"
+local Lang = "tr"
+local SavedKeys = {}
+pcall(function()
+	if typeof(isfile) == "function" and isfile(LANG_FILE) then
+		local v = readfile(LANG_FILE)
+		if v == "en" or v == "tr" then
+			Lang = v
+		end
+	end
+	if typeof(isfile) == "function" and isfile(KEYS_FILE) then
+		local d = game:GetService("HttpService"):JSONDecode(readfile(KEYS_FILE))
+		if type(d) == "table" then
+			SavedKeys = d
+		end
+	end
+end)
+local function saveSettings()
+	pcall(function()
+		if typeof(makefolder) == "function" and typeof(isfolder) == "function" and not isfolder(SETTINGS_DIR) then
+			makefolder(SETTINGS_DIR)
+		end
+		writefile(LANG_FILE, Lang)
+		writefile(KEYS_FILE, game:GetService("HttpService"):JSONEncode(SavedKeys))
+	end)
+end
+
+local EN = {
+	["Oto Larry (goblin birak + kart al)"] = "Auto Larry (drop goblins + buy cards)",
+	["Sadece goblinleri Larry'ye tasi (kart almadan)"] = "Only carry goblins to Larry (no card buying)",
+	["satin alindi: "] = "bought: ",
+	["satin alinamadi: "] = "could not buy: ",
+	["uygun/yeterli kart yok"] = "no affordable card",
+	["aliniyor: "] = "buying: ",
+	["alinan kart: "] = "cards bought: ",
+	["madalya: "] = "medals: ",
+	["teslim: "] = "delivered: ",
+	["teslim edilemedi: "] = "delivery failed: ",
+	["goblin cesedi yok"] = "no goblin corpses",
+	["medkit alindi"] = "medkit acquired",
+	["medkit alinamadi"] = "could not get a medkit",
+	["shop'tan aliniyor: "] = "buying from shop: ",
+	["Satis"] = "Sell",
+	["Hurda"] = "Scrap",
+	["Bosaltma konumu (drill ortasina kaydir)"] = "Dump position (shift toward drill middle)",
+	["Tarama araligi (esya/cevher/yakit/techizat)"] = "Scan interval (items/ores/fuel/gear)",
+	["Tarama butcesi (ms/kare)"] = "Scan budget (ms/frame)",
+	["Harita yukleme istegi araligi"] = "Map-load request interval",
+	["Goblin turlerini topla -> Larry'ye birak"] = "Collect goblin types -> drop at Larry",
+	["Larry durumu"] = "Larry status",
+	["Aninda doldur (hepsini birden birak)"] = "Fill instantly (drop everything at once)",
+	["Konum (Shop / Satis / Hurda)"] = "Location (Shop / Sell / Scrap)",
+	["Secili konuma isinlan"] = "Teleport to selected location",
+	["konum yok"] = "no location",
+	["Listeyi yenile"] = "Refresh list",
+	[" konum"] = " locations",
+	["Medkit yoksa yerden al / shop'tan satin al"] = "If no medkit: pick one up / buy from shop",
+	["Hazir"] = "Ready",
+	["blok %d (%dm) | yapi %d | cevher %d | esya %d | shop %d"] = "block %d (%dm) | structures %d | ores %d | items %d | shops %d",
+	["cevherler araniyor (harita taramasi)"] = "searching ores (map sweep)",
+	["cevhere gidiyor "] = "going to ore ",
+	["Olusun - duraklatildi"] = "You are dead - paused",
+	["Hedef yok ("] = "No target (",
+	[" node)"] = " nodes)",
+	["Mining kapali"] = "Mining off",
+	["drill yok"] = "no drill",
+	["canta yok"] = "no bag",
+	["tarama "] = "sweep ",
+	[" alinan "] = " picked ",
+	["canta dolu"] = "bag full",
+	["alindi: "] = "picked: ",
+	[" (son: "] = " (last: ",
+	["reddedildi"] = "rejected",
+	["filtre disi"] = "filtered out",
+	["teklif yok"] = "no offer",
+	["istasyon yok"] = "no station",
+	["durum alinamadi"] = "state unavailable",
+	["yakit araniyor (harita taramasi)"] = "searching fuel (map sweep)",
+	["topluyor "] = "collecting ",
+	["birakiyor"] = "dropping",
+	["yakit yok"] = "no fuel",
+	["depo yeterli"] = "tank is full enough",
+	["kasa yok: "] = "no register: ",
+	["DragController yok"] = "no DragController",
+	["tutma olmadi: "] = "grab failed: ",
+	["goturuldu: "] = "carried: ",
+	["yerlesmedi: "] = "not placed: ",
+	["elde: "] = "in hand: ",
+	["cantaya alindi: "] = "put in bag: ",
+	["hata: "] = "error: ",
+	["esya yok"] = "no items",
+	["kendim"] = "myself",
+	["herkes saglikli"] = "everyone is healthy",
+	["kusandi: "] = "equipped: ",
+	["kusanilamadi: "] = "could not equip: ",
+	["daha iyi esya yok"] = "no better items",
+	["[Hub] takili kilit acildi"] = "[Hub] stuck lock released",
+	["Maden"] = "Mining",
+	["Tarama"] = "Scan",
+	["Hareket"] = "Movement",
+	["Cevherler"] = "Ores",
+	["Upgrade"] = "Upgrade",
+	["Yakit"] = "Fuel",
+	["Shop"] = "Shop",
+	["Heal"] = "Heal",
+	["Gear"] = "Gear",
+	["Ayarlar"] = "Settings",
+	["Oto Maden (float + vur)"] = "Auto Mine (float + hit)",
+	["Oto Toplama (uzaktan, isinlanmadan)"] = "Auto Pickup (remote, no teleport)",
+	["Canta dolunca drill'e bosalt"] = "Dump bag at the drill when full",
+	["Float (cevhere yaklas, havada kilitli kal)"] = "Float (approach ore, stay locked in the air)",
+	["Cevher menzili"] = "Ore range",
+	["Float yuksekligi (cevher merkezine gore)"] = "Float height (relative to ore center)",
+	["Cevhere uzaklik"] = "Distance to ore",
+	["Vurus araligi"] = "Hit interval",
+	["Anti-fall (bosluk)"] = "Anti-fall (void)",
+	["Kasilan"] = "Mined",
+	["Mesafe"] = "Distance",
+	["Toplanan"] = "Picked up",
+	["Durum"] = "Status",
+	["Cevherleri tara (isimleri yazdir)"] = "Scan ores (print names)",
+	["Anti-Streaming (haritayi yuklu tut)"] = "Anti-Streaming (keep the map loaded)",
+	["Harita kaydet (her 100000m blok)"] = "Save map (every 100000m block)",
+	["Stream tutucu (uzak hedefi yuklu tut)"] = "Stream keeper (keep far target loaded)",
+	["Zindan 3B tarama"] = "Dungeon 3D scan",
+	["Tarama hizi (1 yavas - 5 cok hizli)"] = "Scan speed (1 slow - 5 very fast)",
+	["Stream dalga boyutu"] = "Stream wave size",
+	["Cevher arama sikligi (sn)"] = "Ore search frequency (s)",
+	["Toplama taramasi sikligi (sn)"] = "Pickup sweep frequency (s)",
+	["Toplama hizi (esyalar arasi sn)"] = "Pickup speed (gap between items)",
+	["Toplama menzili"] = "Pickup range",
+	["Tarama sirasinda isinlan (yedek)"] = "Teleport while sweeping (fallback)",
+	["Alinamayan esyanin yanina isinlan"] = "Teleport next to items that can't be picked up",
+	["Tus ata: "] = "Bind key: ",
+	["Ucma"] = "Fly",
+	["Ucma hizi"] = "Fly speed",
+	["Sinirsiz ziplama"] = "Infinite jump",
+	["NoClip"] = "NoClip",
+	["God Mode (yer alti float)"] = "God Mode (underground float)",
+	["God Mode yukseklik"] = "God Mode height",
+	["Mobil butonlar"] = "Mobile buttons",
+	["Acinca ekranda Ucma / Ziplama / NoClip / God butonlari gorunur"] = "When on, Fly / Jump / NoClip / God buttons appear on screen",
+	["Tumunu ac"] = "Enable all",
+	["Tumunu kapat"] = "Disable all",
+	["Oto kart sec (en iyi)"] = "Auto pick card (best)",
+	["Oto Larry upgrade"] = "Auto Larry upgrade",
+	["Oto yakit (topla + birak)"] = "Auto fuel (collect + drop)",
+	["Yakit esigi"] = "Fuel threshold",
+	["Yakitlari tara"] = "Scan fuels",
+	["Oto satin al"] = "Auto buy",
+	["Shop menzili"] = "Shop range",
+	["Esya adi yaz"] = "Enter item name",
+	["Listeye ekle"] = "Add to list",
+	["Shop esyalari tara"] = "Scan shop items",
+	[" yok (su an "] = " does not exist (currently ",
+	[" shop var)"] = " shops)",
+	["Oto heal"] = "Auto heal",
+	["Kendimi de iyilestir"] = "Heal myself too",
+	["Can esigi"] = "Health threshold",
+	["DURUM: "] = "STATUS: ",
+	[" CAN "] = " HP ",
+	["En iyi esyayi bul + kusan"] = "Find + equip the best item",
+	["Tarama menzili"] = "Scan range",
+	["Daha iyi esyalari listele (top 15)"] = "List better items (top 15)",
+	["[GEAR] daha iyi esya yok"] = "[GEAR] no better items",
+	["Dil / Language"] = "Language / Dil",
+	["God Mode"] = "God Mode",
+}
+local function T(s)
+	if Lang == "en" then
+		return EN[s] or s
+	end
+	return s
+end
+
+-- ===== Temiz kurulum =====
+pcall(function()
+	if _G.__OreFarmStop then
+		_G.__OreFarmStop()
+	end
+end)
+pcall(function()
+	for _, c in ipairs(_G.__OreFarmConns or {}) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+end)
+_G.__OreFarmConns = {}
+_G.HubBusy = false
+_G.HubFuelOnly = false
+pcall(function()
+	for _, d in ipairs(game:GetService("CoreGui"):GetDescendants()) do
+		if d.Name == "Ore Farm" and d:IsA("Frame") then
+			local top = d.Parent
+			pcall(function()
+				top:Destroy()
+			end)
+		end
+	end
+end)
+_G.__OreFarmWindow = nil
+task.wait(0.2)
+
+local Knit = require(ReplicatedStorage.Packages.Knit)
+local ItemDatabase = require(ReplicatedStorage.Shared.ItemDatabase)
+
+-- ===== Yardimcilar =====
+local function GA(x, key)
+	local ok, v = pcall(ItemDatabase.GetAttribute, x, key)
+	if ok then
+		return v
+	end
+	return nil
+end
+
+local function ctrl(name)
+	local ok, c = pcall(function()
+		return Knit.GetController(name)
+	end)
+	if ok then
+		return c
+	end
+	return nil
+end
+
+local function service(name)
+	local ok, s = pcall(function()
+		return Knit.GetService(name)
+	end)
+	if ok then
+		return s
+	end
+	return nil
+end
+
+local function getToolService()
+	return service("ToolService")
+end
+
+local Config = {
+	AutoMine = false,
+	AutoPickup = false,
+	Float = true,
+	OreRange = 100000,
+	PickupRange = 100000,
+	FloatHeight = -10,
+	StandOff = 3,
+	GodMode = false,
+	GodOffset = -15,
+	MapRecord = true,
+	StreamKeep = true,
+	AntiStream = true,
+	DungeonGrid = true,
+	StreamBatch = 16,
+	StreamWait = 1.0,
+	ScanSpeed = 3,
+	OreSweepEvery = 5,
+	PickupSweepEvery = 10,
+	PickupInterval = 0.19,
+	PickupTp = true,
+	ScanTick = 0.1,
+	ScanBudget = 4,
+	PulseEvery = 0.5,
+	DumpShift = 5,
+	FuelFast = true,
+	HealGet = true,
+	Fly = false,
+	FlySpeed = 60,
+	InfJump = false,
+	NoClip = false,
+	MobileButtons = false,
+	HitDelay = 0.8,
+	Ores = {
+		coal = true, iron = true, gold = true, diamond = true,
+		emerald = true, ruby = true, voidcoal = true, heartgem = true,
+	},
+}
+
+local State = {
+	running = true,
+	target = nil,
+	targetDist = 0,
+	mined = 0,
+	picked = 0,
+	status = T("Hazir"),
+	lastOre = nil,
+}
+
+local Hub = {
+	Busy = false,
+	BusyTag = nil,
+	AntiFall = true,
+	PickStatus = "-",
+	AutoDump = true,
+	SweepTeleport = false,
+	Dropped = setmetatable({}, { __mode = "k" }),
+	OreSkip = {},
+	OreMem = {},
+	MapStatus = "-",
+	Fail = setmetatable({}, { __mode = "k" }),
+	AutoCard = false,
+	CardRank = {
+		CartExtension = 1, UltraDrill = 2, MoneyDrill = 3, HealthRegen = 4,
+		RPMOverclock = 5, PowerBurst = 6, MountedGunner = 7, LifeSteal = 8,
+		TeamPickaxeDamage = 9, TeamMeleeDamage = 10, TeamGunDamage = 11,
+		TeamExplosiveDamage = 12, PowerSlam = 13, MegaDrill = 14,
+		EngineOverdrive = 15, TeamHealth = 16, SackStorage = 17,
+		PowerDrive = 18, FuelStorage = 19, DriveSpeed = 20,
+		DrillPower = 21, DrillDefense = 22,
+	},
+	CardOn = {},
+	CardTry = {},
+	CardStatus = "-",
+	LarryAuto = false,
+	LarryRank = { "CannonExplosiveDamage", "TurretDamage", "FlameDuration", "FrostDuration", "FlameRechargeSpeed", "FrostRechargeSpeed", "SettlementGunnerDamage", "SettlementGunnerAmmo" },
+	LarryOn = {},
+	LarryStatus = "-",
+	CorpseAuto = false,
+	CorpseStatus = "-",
+	CorpseDone = 0,
+	FuelAuto = false,
+	FuelPct = 50,
+	FuelOn = {},
+	FuelToggles = {},
+	FuelStatus = "-",
+	FuelDone = 0,
+	ShopAuto = false,
+	ShopOn = {},
+	ShopToggles = {},
+	ShopBought = setmetatable({}, { __mode = "k" }),
+	ShopStatus = "-",
+	ShopDone = 0,
+	ShopRange = 100000,
+	HealAuto = false,
+	SelfHeal = false,
+	HealPct = 50,
+	HealStatus = "-",
+	GearAuto = false,
+	GearRange = 100000,
+	GearStatus = "-",
+	GearBest = "-",
+}
+for _k in pairs(Hub.CardRank) do
+	Hub.CardOn[_k] = true
+end
+for _, _id in ipairs(Hub.LarryRank) do
+	Hub.LarryOn[_id] = true
+end
+
+local function addConn(c)
+	table.insert(_G.__OreFarmConns, c)
+	return c
+end
+
+local function isAlive()
+	local ch = LocalPlayer.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	return hum ~= nil and hum.Health > 0
+end
+
+local function hrp()
+	local ch = LocalPlayer.Character
+	return ch and ch:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function posOf(inst)
+	if not inst then
+		return nil
+	end
+	local ok, cf = pcall(function()
+		return inst:GetPivot()
+	end)
+	if ok and cf then
+		return cf.Position
+	end
+	if inst:IsA("BasePart") then
+		return inst.Position
+	end
+	return nil
+end
+
+local function charPivot()
+	local h = hrp()
+	if h then
+		return h.Position
+	end
+	return posOf(LocalPlayer.Character) or Vector3.new(0, 0, 0)
+end
+
+-- ===== World tarayici: Workspace'in TUM alt dallari, surekli =====
+local function topChild(d)
+	local a = d
+	while a.Parent and a.Parent ~= RealWorkspace do
+		a = a.Parent
+	end
+	return a
+end
+
+local function skipTree(d)
+	local top = topChild(d)
+	local n = top.Name
+	if n == "Chunks" or n == "Npc" or string.sub(n, 1, 8) == "CutScene" then
+		return true
+	end
+	if top:IsA("Model") and top:FindFirstChildOfClass("Humanoid") then
+		return true
+	end
+	local a = d.Parent
+	while a and a ~= RealWorkspace do
+		if a:IsA("Tool") or a.Name == "WeldFolder" then
+			return true
+		end
+		a = a.Parent
+	end
+	return false
+end
+
+local function classify(d)
+	if not (d:IsA("Model") or d:IsA("BasePart")) then
+		return
+	end
+	if d:IsA("Model") and d:GetAttribute("Category") == "Corpse" then
+		World.corpses[d] = true
+		return
+	end
+	local par = d.Parent
+	if d:GetAttribute("SessionOreType") ~= nil then
+		if not (par and par:GetAttribute("SessionOreType") ~= nil) then
+			World.ores[d] = true
+		end
+	elseif d:GetAttribute("ItemDatabaseId") ~= nil or d:GetAttribute("ItemDatabaseTemplate") ~= nil then
+		if par and (par:GetAttribute("ItemDatabaseId") ~= nil or par:GetAttribute("ItemDatabaseTemplate") ~= nil) then
+			return
+		end
+		if not skipTree(d) then
+			World.items[d] = true
+		end
+	end
+end
+
+addConn(RealWorkspace.DescendantAdded:Connect(function(d)
+	task.defer(classify, d)
+end))
+
+-- zaman butceli artimli tarama (her Config.ScanTick'te yeni tur). Yeni olusan her sey DescendantAdded ile ANINDA yakalanir.
+-- Agir ve alakasiz agaclar (Chunks, CutScene*, Npc, Terrain) tur disi: tam tur ~6ms.
+do
+	local snap, idx, lastStart = {}, 1, 0
+	local SKIP_TOP = { Chunks = true, Npc = true, Terrain = true, Camera = true }
+	local function buildSnapshot()
+		local out = {}
+		for _, c in ipairs(RealWorkspace:GetChildren()) do
+			local n = c.Name
+			if not SKIP_TOP[n] and string.sub(n, 1, 8) ~= "CutScene" then
+				out[#out + 1] = c
+				local ds = c:GetDescendants()
+				table.move(ds, 1, #ds, #out + 1, out)
+			end
+		end
+		return out
+	end
+	addConn(RunService.Heartbeat:Connect(function()
+		if not State.running then
+			return
+		end
+		local t0 = os.clock()
+		if idx > #snap then
+			if t0 - lastStart >= Config.ScanTick then
+				listOf(World.items)
+				listOf(World.ores)
+				listOf(World.corpses)
+				snap = buildSnapshot()
+				idx = 1
+				lastStart = t0
+			end
+			return
+		end
+		local budget = (Config.ScanBudget or 4) / 1000
+		while idx <= #snap do
+			classify(snap[idx])
+			idx = idx + 1
+			if idx % 100 == 0 and os.clock() - t0 > budget then
+				break
+			end
+		end
+	end))
+end
+
+-- ===== Alet yonetimi =====
+local function activeToolName()
+	local tc = ctrl("ToolController")
+	if not tc then
+		return nil
+	end
+	local ok, nm = pcall(function()
+		local at = tc.ActiveTool
+		if at and at.Tool and at.Tool.Parent then
+			return at.Tool.Name
+		end
+		return nil
+	end)
+	if ok then
+		return nm
+	end
+	return nil
+end
+
+local function findTool(fn)
+	local ch = LocalPlayer.Character
+	if ch then
+		for _, t in ipairs(ch:GetChildren()) do
+			if t:IsA("Tool") and fn(t) then
+				return t, true
+			end
+		end
+	end
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if bp then
+		for _, t in ipairs(bp:GetChildren()) do
+			if t:IsA("Tool") and fn(t) then
+				return t, false
+			end
+		end
+	end
+	return nil, false
+end
+
+local function ensureToolMatch(fn)
+	if not isAlive() then
+		return nil
+	end
+	local ch = LocalPlayer.Character
+	if not ch then
+		return nil
+	end
+	if activeToolName() ~= nil then
+		for _, t in ipairs(ch:GetChildren()) do
+			if t:IsA("Tool") and fn(t) then
+				return t
+			end
+		end
+	end
+	local cand = findTool(fn)
+	if not cand then
+		return nil
+	end
+	local svc = getToolService()
+	if svc then
+		if activeToolName() ~= nil then
+			pcall(function()
+				if svc.UnequipTool then
+					svc:UnequipTool()
+				end
+			end)
+			task.wait(0.6)
+		end
+		pcall(function()
+			if svc.EquipTool then
+				svc:EquipTool(cand)
+			end
+		end)
+		local t0 = os.clock()
+		while os.clock() - t0 < 3 do
+			if cand.Parent == ch and activeToolName() ~= nil then
+				task.wait(0.2)
+				return cand
+			end
+			task.wait(0.1)
+		end
+		if cand.Parent == ch then
+			return cand
+		end
+		return nil
+	end
+	local hum = ch:FindFirstChildOfClass("Humanoid")
+	if hum and cand.Parent ~= ch then
+		pcall(function()
+			hum:EquipTool(cand)
+		end)
+	end
+	return cand
+end
+
+local function isBagTool(t)
+	return t ~= nil and (t.Name == "ItemBag" or t.Name == "Large_Sack" or GA(t, "Class") == "ItemBag")
+end
+
+local function ensureBag()
+	return ensureToolMatch(isBagTool) ~= nil
+end
+
+local function isPickaxeTool(t)
+	return GA(t, "Class") == "Pickaxe" or string.find(string.lower(t.Name), "pickaxe") ~= nil
+end
+
+local function ensurePickaxe()
+	return ensureToolMatch(isPickaxeTool) ~= nil
+end
+
+local function isMedkitTool(t)
+	if GA(t, "Class") == "Medkit" then
+		return true
+	end
+	local n = string.lower(t.Name)
+	return string.find(n, "medkit") ~= nil or string.find(n, "bandage") ~= nil
+end
+
+-- canta doluluk: (size, max) -- canta aktif alet degilse nil
+local function bagInfo()
+	local tc = ctrl("ToolController")
+	local at = tc and tc.ActiveTool
+	if at and at.Tool and isBagTool(at.Tool) then
+		return at.Size or 0, at.MaxSize or 10
+	end
+	return nil, nil
+end
+
+-- ===== Mesguliyet kilidi (ayni anda tek isinlanma islemi) =====
+local function setBusy(b)
+	Hub.Busy = b
+	_G.HubBusy = b
+	Hub._BusySince = b and os.clock() or nil
+end
+
+local function touchBusy()
+	if _G.HubBusy then
+		Hub._BusySince = os.clock()
+	end
+end
+
+local function acquire(tag)
+	local t0 = os.clock()
+	while _G.HubBusy do
+		if not State.running then
+			return false
+		end
+		task.wait(0.25)
+		if os.clock() - t0 > 180 then
+			return false
+		end
+	end
+	setBusy(true)
+	Hub.BusyTag = tag
+	return true
+end
+
+local function release()
+	setBusy(false)
+	Hub.BusyTag = nil
+end
+
+local function tpToPos(pos, up)
+	local h = hrp()
+	if not h or not pos then
+		return false
+	end
+	h.CFrame = CFrame.new(pos + Vector3.new(0, up or 5, 0))
+	h.AssemblyLinearVelocity = Vector3.zero
+	h.AssemblyAngularVelocity = Vector3.zero
+	return true
+end
+
+local function tpSave()
+	local h = hrp()
+	return h and h.CFrame or nil
+end
+
+local function tpBack(cf)
+	local h = hrp()
+	if h and cf then
+		h.CFrame = cf
+		h.AssemblyLinearVelocity = Vector3.zero
+		h.AssemblyAngularVelocity = Vector3.zero
+	end
+end
+
+-- ===== Noclip (float icin) =====
+local MAIN_PARTS = { "HumanoidRootPart", "Head", "UpperTorso", "LowerTorso", "Torso" }
+local function setNoClip(on)
+	local ch = LocalPlayer.Character
+	if not ch then
+		return
+	end
+	if on then
+		if os.clock() - (Hub._NoClipAt or 0) < 0.3 then
+			return
+		end
+		Hub._NoClipAt = os.clock()
+		for _, p in ipairs(ch:GetDescendants()) do
+			if p:IsA("BasePart") and p.CanCollide then
+				p.CanCollide = false
+			end
+		end
+		Hub._NoClip = true
+	elseif Hub._NoClip then
+		for _, n in ipairs(MAIN_PARTS) do
+			local p = ch:FindFirstChild(n)
+			if p and p:IsA("BasePart") then
+				p.CanCollide = true
+			end
+		end
+		Hub._NoClip = false
+	end
+end
+
+_G.__OreFarmStop = function()
+	State.running = false
+	pcall(function()
+		if Hub.GodCleanup then
+			Hub.GodCleanup()
+		end
+	end)
+	_G.HubBusy = false
+	pcall(function()
+		for _, c in ipairs(_G.__OreFarmConns or {}) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+		_G.__OreFarmConns = {}
+	end)
+	pcall(function()
+		setNoClip(false)
+	end)
+end
+
+-- ===== Esya yardimcilari =====
+local function canStore(it)
+	if not it or not it.Parent then
+		return false
+	end
+	if it:IsA("Model") and it:FindFirstChildOfClass("Humanoid") then
+		return false
+	end
+	if it.Name == "Money_Sack" or it.Name == "SoulOrb" then
+		return false
+	end
+	if CollectionService:HasTag(it, "ShopItem") then
+		return false
+	end
+	if it:GetAttribute("CraftedPlaceable") == true and it:GetAttribute("Placed") ~= true then
+		return false
+	end
+	if it:GetAttribute("Category") == "Corpse" or GA(it, "Category") == "Corpse" then
+		return false
+	end
+	return true
+end
+
+local function isFuelItem(it)
+	local f = GA(it, "Fuel")
+	return type(f) == "number" and f > 0 and GA(it, "Tool") ~= true and not CollectionService:HasTag(it, "ShopItem")
+end
+
+local function recentlyFailed(it)
+	local t = Hub.Fail[it]
+	return t ~= nil and os.clock() - t < 60
+end
+
+-- cantaya al: canta aktif olmali, esya Items'tan kalkarsa basarili
+local function bagPickup(it, timeout)
+	local svc = getToolService()
+	if not svc or not svc.Update or not it or not it.Parent then
+		return false
+	end
+	pcall(function()
+		svc.Update:Fire({ "Pickup", it })
+	end)
+	local t0 = os.clock()
+	while os.clock() - t0 < (timeout or 2.5) do
+		if not it.Parent then
+			break
+		end
+		task.wait(0.05)
+	end
+	return it.Parent == nil
+end
+
+local function drillBehindPos()
+	local d = Workspace:FindFirstChild("Drill")
+	if not d then
+		return nil
+	end
+	local ftp = d:FindFirstChild("FuelTouchPart", true)
+	if ftp and ftp:IsA("BasePart") then
+		return ftp.Position
+	end
+	local ok, cf = pcall(function()
+		return d:GetPivot()
+	end)
+	if ok then
+		return (cf * CFrame.new(0, 0, 14)).Position
+	end
+	return nil
+end
+
+-- bosaltma konumu: yakit noktasindan drill'in ortasina dogru Config.DumpShift stud kaydirilmis
+local function drillDumpPos()
+	local d = Workspace:FindFirstChild("Drill")
+	if not d then
+		return nil
+	end
+	local base = drillBehindPos()
+	if not base then
+		return nil
+	end
+	local okb, bcf = pcall(function()
+		return d:GetBoundingBox()
+	end)
+	if okb and bcf then
+		local dir = bcf.Position - base
+		dir = Vector3.new(dir.X, 0, dir.Z)
+		if dir.Magnitude > 0.5 then
+			return base + dir.Unit * math.min(Config.DumpShift, dir.Magnitude)
+		end
+	end
+	return base
+end
+
+local function drillFuelPct()
+	local d = Workspace:FindFirstChild("Drill")
+	if not d then
+		return 100, 0, 100
+	end
+	local f = d:GetAttribute("Fuel") or 0
+	local m = d:GetAttribute("MaxFuel") or 100
+	if m <= 0 then
+		return 100, f, m
+	end
+	return f / m * 100, f, m
+end
+
+-- ===== Gear slot mantigi =====
+local ARMOR_SLOT = { Head = "Helmet", Helmet = "Helmet", Torso = "Chest", Chest = "Chest", Leg = "Legs", Legs = "Legs", Boot = "Boots", Boots = "Boots" }
+local GUN_CATS = { ["Primary Gun"] = true, ["Secondary Gun"] = true, ["Primary Weapon"] = true, ["Secondary Weapon"] = true }
+local GUN_CLASS = { Rifle = "Primary Gun", Revolver = "Secondary Gun", Shotgun = "Gun:Shotgun" }
+
+local function slotOf(x)
+	local at = GA(x, "ArmorType")
+	if at ~= nil then
+		return "Armor:" .. (ARMOR_SLOT[at] or tostring(at))
+	end
+	if GA(x, "Category") == "Armor" then
+		return nil
+	end
+	local cls = GA(x, "Class")
+	if cls == "Sword" or cls == "Pickaxe" then
+		return cls
+	end
+	local dc = GA(x, "DisplayCategory")
+	if GUN_CATS[dc] then
+		return dc
+	end
+	if GUN_CLASS[cls] then
+		return GUN_CLASS[cls]
+	end
+	return nil
+end
+
+local function scoreOf(x, slot)
+	if string.sub(slot, 1, 6) == "Armor:" then
+		local a = GA(x, "Armor")
+		return type(a) == "number" and a or 0
+	end
+	local d = GA(x, "Damage")
+	local v = GA(x, "Value")
+	return (type(d) == "number" and d or 0) * 1000 + (type(v) == "number" and v or 0) * 0.001
+end
+
+-- elde/sirtta/giyili en iyi skorlar (slot -> skor)
+local function currentBest()
+	local best = {}
+	local function consider(slot, score)
+		if slot and (best[slot] == nil or score > best[slot]) then
+			best[slot] = score
+		end
+	end
+	local function scanTools(container)
+		if not container then
+			return
+		end
+		for _, t in ipairs(container:GetChildren()) do
+			if t:IsA("Tool") then
+				local s = slotOf(t)
+				if s then
+					consider(s, scoreOf(t, s))
+				end
+			end
+		end
+	end
+	local ch = LocalPlayer.Character
+	scanTools(ch)
+	scanTools(LocalPlayer:FindFirstChildOfClass("Backpack"))
+	if ch then
+		for _, d in ipairs(ch:GetChildren()) do
+			local an = d:GetAttribute("ArmorName")
+			local at = d:GetAttribute("ArmorType")
+			if typeof(an) == "string" and an ~= "" and at ~= nil then
+				local slot = "Armor:" .. (ARMOR_SLOT[at] or tostring(at))
+				local a = GA(an, "Armor")
+				consider(slot, type(a) == "number" and a or 0)
+			end
+		end
+	end
+	return best
+end
+
+-- ===== Cevher yardimcilari =====
+local function sessionTypeOf(ore)
+	local ok, v = pcall(function()
+		return ore:GetAttribute("SessionOreType")
+	end)
+	if ok then
+		return tostring(v or "")
+	end
+	return ""
+end
+
+local function isOreEnabled(sessionType)
+	local s = string.lower(sessionType or "")
+	if s == "" then
+		return false
+	end
+	for base, on in pairs(Config.Ores) do
+		if on and string.find(s, string.lower(base), 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function oreHealth(ore)
+	local h = ore:FindFirstChild("Health")
+	if h and typeof(h.Value) == "number" then
+		return h.Value
+	end
+	return 1
+end
+
+local function findNearestOre()
+	local oresFolder = Workspace:FindFirstChild("Ores")
+	if not oresFolder then
+		return nil, 0
+	end
+	local myPos = charPivot()
+	local best, bestD = nil, Config.OreRange
+	for _, ore in ipairs(oresFolder:GetChildren()) do
+		local st = sessionTypeOf(ore)
+		if st ~= "" and isOreEnabled(st) and oreHealth(ore) > 0 then
+			local pos = posOf(ore)
+			if pos then
+				local d = (pos - myPos).Magnitude
+				if d <= Config.OreRange and (best == nil or d < bestD) then
+					best, bestD = ore, d
+				end
+			end
+		end
+	end
+	return best, bestD
+end
+
+local function swingAt(ore)
+	if not ore or not ore.Parent or not isAlive() then
+		return false
+	end
+	local svc = getToolService()
+	if not svc or not svc.Update then
+		return false
+	end
+	return pcall(function()
+		svc.Update:Fire({ "Swing", { ore } })
+	end)
+end
+
+-- ===== Float (Heartbeat) =====
+addConn(RunService.Heartbeat:Connect(function()
+	if not State.running then
+		return
+	end
+	local t = State.target
+	local mining = Config.AutoMine and Config.Float and isAlive() and not _G.HubBusy
+	local active = mining and t and t.Parent
+	if not active then
+		if mining and not Config.Fly and not Config.GodMode then
+			-- HOLD: cevher kirilsa bile oldugun yerde havada asili kal (dusme)
+			local hh = hrp()
+			if hh then
+				if not Hub.HoldCF then
+					Hub.HoldCF = hh.CFrame
+				end
+				setNoClip(true)
+				hh.CFrame = Hub.HoldCF
+				hh.AssemblyLinearVelocity = Vector3.zero
+				hh.AssemblyAngularVelocity = Vector3.zero
+			end
+			return
+		end
+		Hub.HoldCF = nil
+		if Hub._NoClip and not _G.HubBusy and not Config.GodMode and not Config.NoClip then
+			setNoClip(false)
+		end
+		return
+	end
+	local h = hrp()
+	local pos = posOf(t)
+	if not h or not pos then
+		return
+	end
+	setNoClip(true)
+	local cur = h.Position
+	local flat = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z)
+	local dirH
+	if flat.Magnitude > 0.5 then
+		dirH = flat.Unit
+	else
+		local lv = h.CFrame.LookVector
+		local lf = Vector3.new(lv.X, 0, lv.Z)
+		dirH = lf.Magnitude > 0.1 and lf.Unit or Vector3.new(0, 0, -1)
+	end
+	local dest = pos - dirH * Config.StandOff + Vector3.new(0, Config.FloatHeight, 0)
+	local newPos
+	if (dest - cur).Magnitude > 2 then
+		newPos = cur:Lerp(dest, 0.35)
+	else
+		newPos = dest
+	end
+	h.CFrame = CFrame.new(newPos, Vector3.new(pos.X, newPos.Y, pos.Z))
+	h.AssemblyLinearVelocity = Vector3.zero
+	h.AssemblyAngularVelocity = Vector3.zero
+	Hub.HoldCF = h.CFrame
+end))
+
+
+-- ===== Kamera zoom kilidini kaldir (oyun CameraController maxZoom'u 16'ya kilitliyor) =====
+task.spawn(function()
+	while State.running do
+		pcall(function()
+			local cc = ctrl("CameraController")
+			if cc then
+				local g = cc.GameplayCameraSettings
+				if type(g) == "table" then
+					g.maxZoom = 100000
+				end
+				if type(cc.Overrides) == "table" then
+					for _, v in pairs(cc.Overrides) do
+						if type(v) == "table" and v.maxZoom then
+							v.maxZoom = 100000
+						end
+					end
+				end
+			end
+			if LocalPlayer.CameraMaxZoomDistance < 100000 then
+				LocalPlayer.CameraMaxZoomDistance = 100000
+			end
+		end)
+		task.wait(0.5)
+	end
+end)
+
+-- ===== God Mode (yer alti float, kamera zeminin ustunde) =====
+local God = { floorY = nil, camPart = nil, on = false }
+
+local function godFloorAt(x, z, hintY)
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { LocalPlayer.Character, God.camPart }
+	local hit = Workspace:Raycast(Vector3.new(x, hintY + 6, z), Vector3.new(0, -60, 0), rp)
+	if hit then
+		return hit.Position.Y
+	end
+	return nil
+end
+
+addConn(RunService.Heartbeat:Connect(function(dt)
+	if not State.running then
+		return
+	end
+	local want = Config.GodMode and isAlive()
+	if not want then
+		if God.on then
+			God.on = false
+			local h0 = hrp()
+			if h0 and God.floorY then
+				h0.CFrame = CFrame.new(h0.Position.X, God.floorY + 3.5, h0.Position.Z)
+				h0.AssemblyLinearVelocity = Vector3.zero
+			end
+			setNoClip(false)
+		end
+		return
+	end
+	local h = hrp()
+	if not h then
+		return
+	end
+	if not God.on then
+		God.on = true
+		God.floorY = godFloorAt(h.Position.X, h.Position.Z, h.Position.Y - 3) or (h.Position.Y - 3)
+	end
+	local mining = Config.AutoMine and Config.Float and State.target and State.target.Parent
+	if _G.HubBusy or mining then
+		return
+	end
+	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+	local cur = h.Position
+	local nx, nz = cur.X, cur.Z
+	if hum then
+		local md = hum.MoveDirection
+		nx = nx + md.X * hum.WalkSpeed * dt
+		nz = nz + md.Z * hum.WalkSpeed * dt
+	end
+	local gy = godFloorAt(nx, nz, God.floorY)
+	if gy and math.abs(gy - God.floorY) < 30 then
+		God.floorY = gy
+	end
+	setNoClip(true)
+	-- yatay, yuz yere bakacak sekilde (90 derece)
+	local gcam = Workspace.CurrentCamera
+	local yaw = 0
+	if gcam then
+		local lv = gcam.CFrame.LookVector
+		yaw = math.atan2(-lv.X, -lv.Z)
+	end
+	h.CFrame = CFrame.new(nx, God.floorY + Config.GodOffset, nz) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(math.rad(-90), 0, 0)
+	h.AssemblyLinearVelocity = Vector3.zero
+	h.AssemblyAngularVelocity = Vector3.zero
+end))
+
+addConn(RunService.RenderStepped:Connect(function()
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		return
+	end
+	if God.on and God.floorY then
+		local h = hrp()
+		if not h then
+			return
+		end
+		if not God.camPart or not God.camPart.Parent then
+			local p = Instance.new("Part")
+			p.Name = "GodCamPart"
+			p.Anchored = true
+			p.CanCollide = false
+			p.CanQuery = false
+			p.CanTouch = false
+			p.Transparency = 1
+			p.Size = Vector3.new(1, 1, 1)
+			p.Parent = RealWorkspace
+			God.camPart = p
+		end
+		God.camPart.Position = Vector3.new(h.Position.X, God.floorY + 4, h.Position.Z)
+		if cam.CameraSubject ~= God.camPart then
+			cam.CameraSubject = God.camPart
+		end
+	elseif God.camPart and cam.CameraSubject == God.camPart then
+		local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+		if hum then
+			cam.CameraSubject = hum
+		end
+	end
+end))
+
+Hub.GodCleanup = function()
+	Config.GodMode = false
+	pcall(function()
+		local cam = Workspace.CurrentCamera
+		local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+		if cam and hum and God.camPart and cam.CameraSubject == God.camPart then
+			cam.CameraSubject = hum
+		end
+		if God.camPart then
+			God.camPart:Destroy()
+			God.camPart = nil
+		end
+	end)
+end
+
+-- ===== Harita kaydi (her 100000m blok icin ayri dosya: OreFarm/map_block_N.json) =====
+-- 100000 metre = haritanin sonu; ondan sonra "Infinite" bant baslayip harita degisiyor.
+local HttpService = game:GetService("HttpService")
+local okDS, DepthScale = pcall(function()
+	return require(ReplicatedStorage.Shared.Util.DepthScale)
+end)
+local MAP_DIR = "OreFarm"
+local Rec = { blocks = {}, cur = 0, lastWrite = {}, dirty = {} }
+
+local function r1(n)
+	return math.floor(n + 0.5)
+end
+
+local function depthMeters(pos)
+	if okDS and DepthScale and pos then
+		local ok, v = pcall(function()
+			return DepthScale.GetLogicalMetersFromWorldPosition(pos)
+		end)
+		if ok and type(v) == "number" then
+			return v
+		end
+	end
+	return 0
+end
+
+local function blockPath(n)
+	return MAP_DIR .. "/map_block_" .. n .. "_" .. tostring(Workspace:GetAttribute("SessionRunSeed") or 0) .. ".json"
+end
+
+local function getBlock(n)
+	local b = Rec.blocks[n]
+	if b then
+		return b
+	end
+	b = { block = n, models = {}, ores = {}, items = {}, shops = {}, meta = {} }
+	pcall(function()
+		if typeof(isfile) == "function" and isfile(blockPath(n)) then
+			local d = HttpService:JSONDecode(readfile(blockPath(n)))
+			if type(d) == "table" then
+				for _, k in ipairs({ "models", "ores", "items", "shops" }) do
+					if type(d[k]) == "table" then
+						b[k] = d[k]
+					end
+				end
+				if type(d.meta) == "table" then
+					b.meta = d.meta
+				end
+			end
+		end
+	end)
+	Rec.blocks[n] = b
+	for k, o in pairs(b.ores) do
+		if type(o) == "table" and o.x and not Hub.OreMem[k] then
+			Hub.OreMem[k] = { t = o.t, x = o.x, y = o.y, z = o.z }
+		end
+	end
+	return b
+end
+
+local DUNGEON_PAT = { "Dungeon", "SpiderPit", "SpiderTunnel", "VampireMansion", "Mineshaft" }
+local SKIP_MODELS = { Drill = true, GunEmulator = true, YourCrate = true }
+local function modelKind(name)
+	for _, p in ipairs(DUNGEON_PAT) do
+		if string.find(name, p, 1, true) then
+			return "dungeon"
+		end
+	end
+	return "camp"
+end
+
+local function countOf(t)
+	local c = 0
+	for _ in pairs(t) do
+		c = c + 1
+	end
+	return c
+end
+
+local function recordScan()
+	local h = hrp()
+	if not h then
+		return
+	end
+	local meters = depthMeters(h.Position)
+	local n = math.max(0, math.floor(meters / 100000))
+	Rec.cur = n
+	local b = getBlock(n)
+	local changed = false
+	b.meta.seed = Workspace:GetAttribute("SessionRunSeed")
+	b.meta.band = Workspace:GetAttribute("InfiniteBandIndex")
+	if os.clock() - (Rec._m or 0) > 10 then
+		Rec._m = os.clock()
+		for _, m in ipairs(Workspace:GetChildren()) do
+			if m:IsA("Model") and not SKIP_MODELS[m.Name] and m ~= LocalPlayer.Character and not string.find(m.Name, "_CameraFocus", 1, true) then
+				local p = posOf(m)
+				if p then
+					local key = m.Name .. "|" .. r1(p.X) .. "|" .. r1(p.Z)
+					if not b.models[key] then
+						b.models[key] = { n = m.Name, k = modelKind(m.Name), x = r1(p.X), y = r1(p.Y), z = r1(p.Z), m = r1(depthMeters(p)) }
+						changed = true
+					end
+				end
+			end
+		end
+		local seenShop = {}
+		for _, it in ipairs(CollectionService:GetTagged("ShopItem")) do
+			local p = posOf(it)
+			if p then
+				local key = r1(p.X / 150) .. "|" .. r1(p.Z / 150) .. "|" .. r1(p.Y / 150)
+				if not seenShop[key] then
+					seenShop[key] = true
+					if not b.shops[key] then
+						b.shops[key] = { x = r1(p.X), y = r1(p.Y), z = r1(p.Z) }
+						changed = true
+					end
+				end
+			end
+		end
+	end
+	local of = Workspace:FindFirstChild("Ores")
+	if of then
+		for _, o in ipairs(of:GetChildren()) do
+			local p = posOf(o)
+			if p then
+				local key = o.Name .. "|" .. r1(p.X) .. "|" .. r1(p.Z)
+				if not b.ores[key] then
+					b.ores[key] = { n = o.Name, t = sessionTypeOf(o), x = r1(p.X), y = r1(p.Y), z = r1(p.Z), m = r1(depthMeters(p)) }
+					changed = true
+				end
+			end
+		end
+	end
+	local items = Workspace:FindFirstChild("Items")
+	if items then
+		for _, it in ipairs(items:GetChildren()) do
+			if it.Name ~= "Money_Sack" and it.Name ~= "SoulOrb" and not Hub.Dropped[it] and not CollectionService:HasTag(it, "ShopItem") then
+				local p = posOf(it)
+				if p then
+					local key = it.Name .. "|" .. r1(p.X) .. "|" .. r1(p.Z)
+					if not b.items[key] then
+						b.items[key] = { n = it.Name, c = GA(it, "Class"), x = r1(p.X), y = r1(p.Y), z = r1(p.Z), m = r1(depthMeters(p)) }
+						changed = true
+					end
+				end
+			end
+		end
+	end
+	if changed then
+		Rec.dirty[n] = true
+	end
+	if Rec.dirty[n] and os.clock() - (Rec.lastWrite[n] or 0) > 10 then
+		Rec.lastWrite[n] = os.clock()
+		Rec.dirty[n] = nil
+		pcall(function()
+			if typeof(makefolder) == "function" and typeof(isfolder) == "function" and not isfolder(MAP_DIR) then
+				makefolder(MAP_DIR)
+			end
+			b.meta.saved = os.time()
+			b.meta.meters = r1(meters)
+			writefile(blockPath(n), HttpService:JSONEncode(b))
+		end)
+	end
+	Hub.MapStatus = string.format(T("blok %d (%dm) | yapi %d | cevher %d | esya %d | shop %d"), n, r1(meters), countOf(b.models), countOf(b.ores), countOf(b.items), countOf(b.shops))
+end
+
+task.spawn(function()
+	while State.running do
+		if Config.MapRecord then
+			pcall(recordScan)
+		end
+		task.wait(5)
+	end
+end)
+
+local function dungeonPositions()
+	local list = {}
+	local b = Rec.blocks[Rec.cur]
+	if b then
+		for _, m in pairs(b.models) do
+			if m.k == "dungeon" then
+				list[#list + 1] = Vector3.new(m.x, m.y, m.z)
+			end
+		end
+	end
+	return list
+end
+
+-- ===== Streaming'i asma (v5.2) =====
+-- CANLI TEST SONUCLARI:
+--  * Player:RequestStreamAroundAsync HICBIR ZAMAN geri donmuyor ama bolgeyi ~3-5sn yukluyor
+--    -> bekleme yok: thread'i at, 4sn sonra iptal et (pulse).
+--  * Birden fazla istek ayni anda calisiyor; istek yaricapi ~400 stud.
+--  * workspace.StreamingEnabled=false istemciden yazilabiliyor ama sunucu yine gondermiyor (ise yaramiyor).
+--  * Zindanlar kapi z'sinden (-658 kuzey / -882 guney) yoldan uzaga ~2000 stud uzaniyor; SpiderPit y=600'e kadar.
+local DUNGEON_NAMES = { "Dungeon", "SpiderPit", "SpiderTunnel", "VampireMansion", "Mineshaft" }
+local function isDungeonModel(m)
+	for _, p in ipairs(DUNGEON_NAMES) do
+		if string.find(m.Name, p, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function pulse(pos)
+	local th = task.spawn(function()
+		pcall(function()
+			LocalPlayer:RequestStreamAroundAsync(pos, 3)
+		end)
+	end)
+	task.delay(4, function()
+		pcall(task.cancel, th)
+	end)
+end
+
+local SHAPES = {
+	{ "SpiderPit", { dz = { 0, 400, 800, 1200, 1600 }, ys = { 0, 300, 600 }, xs = { 0 } } },
+	{ "Mineshaft", { dz = { 400, 800, 1200, 1600, 2000 }, ys = { 0 }, xs = { 0 } } },
+	{ "VampireMansion", { dz = { 0, 400, 800 }, ys = { 0 }, xs = { 0 } } },
+	{ "SpiderTunnel", { dz = { 300, 700, 1000 }, ys = { 0 }, xs = { 0 } } },
+	{ "Tier3C", { dz = { 0, 400, 800 }, ys = { 0 }, xs = { -250, 0, 250 } } },
+	{ "Tutorial", { dz = { 0, 400, 800 }, ys = { 0 }, xs = { -400, 0, 400 } } },
+	{ "DungeonGate", { dz = { 0, 400, 800 }, ys = { 0 }, xs = { 0 } } },
+}
+local DEFAULT_SHAPE = { dz = { 0, 500, 1000, 1500, 2000 }, ys = { 0, 300 }, xs = { 0 } }
+
+local function roadZ()
+	local e = Workspace:GetAttribute("End_Position")
+	return (typeof(e) == "Vector3") and e.Z or -771
+end
+
+local function gridFor(m)
+	local pts = {}
+	local p = posOf(m)
+	if not p then
+		return pts
+	end
+	local rz = roadZ()
+	local sign = (p.Z > rz) and 1 or -1
+	local base = Vector3.new(p.X, 35, rz + (sign > 0 and 113 or -111))
+	local shape = DEFAULT_SHAPE
+	for _, s in ipairs(SHAPES) do
+		if string.find(m.Name, s[1], 1, true) then
+			shape = s[2]
+			break
+		end
+	end
+	for _, dx in ipairs(shape.xs) do
+		for _, dy in ipairs(shape.ys) do
+			for _, dz in ipairs(shape.dz) do
+				pts[#pts + 1] = base + Vector3.new(dx, dy, dz * sign)
+			end
+		end
+	end
+	local ok, cf, size = pcall(function()
+		return m:GetBoundingBox()
+	end)
+	if ok and size and size.Magnitude > 50 then
+		local mn = cf.Position - size / 2
+		local mx = cf.Position + size / 2
+		for x = mn.X + 150, mx.X + 150, 300 do
+			for y = mn.Y + 150, mx.Y + 150, 300 do
+				for z = mn.Z + 150, mx.Z + 150, 300 do
+					if #pts < 120 then
+						pts[#pts + 1] = Vector3.new(x, y, z)
+					end
+				end
+			end
+		end
+	end
+	return pts
+end
+
+local function streamPositions()
+	local list = {}
+	local function add(p, sep)
+		sep = sep or 250
+		for _, q in ipairs(list) do
+			if (q - p).Magnitude < sep then
+				return
+			end
+		end
+		list[#list + 1] = p
+	end
+	local inDungeon = LocalPlayer:GetAttribute("InDungeon") == true
+	if inDungeon then
+		local me = charPivot()
+		add(me, 1)
+		for _, o in ipairs({ Vector3.new(300, 0, 0), Vector3.new(-300, 0, 0), Vector3.new(0, 0, 300), Vector3.new(0, 0, -300), Vector3.new(0, 150, 0), Vector3.new(0, -150, 0) }) do
+			add(me + o, 1)
+		end
+		local bestPts, bestD = nil, 1e12
+		for _, m in ipairs(Workspace:GetChildren()) do
+			if m:IsA("Model") and isDungeonModel(m) then
+				local pts = gridFor(m)
+				local md = 1e12
+				for _, q in ipairs(pts) do
+					local d = (q - me).Magnitude
+					if d < md then
+						md = d
+					end
+				end
+				if md < bestD then
+					bestPts, bestD = pts, md
+				end
+			end
+		end
+		if bestPts and bestD < 3000 then
+			for _, q in ipairs(bestPts) do
+				add(q, 200)
+			end
+		end
+		return list
+	end
+	local rz = roadZ()
+	local endPos = Workspace:GetAttribute("End_Position")
+	local startPos = Workspace:GetAttribute("Start_Position")
+	local x0 = (typeof(startPos) == "Vector3") and (startPos.X - 100) or -800
+	local x1 = (typeof(endPos) == "Vector3") and (endPos.X + 600) or 33800
+	local drill = Workspace:FindFirstChild("Drill")
+	local dp = drill and posOf(drill)
+	if dp and dp.X + 8000 > x1 then
+		x1 = dp.X + 8000
+	end
+	if Config.DungeonGrid then
+		for _, m in ipairs(Workspace:GetChildren()) do
+			if m:IsA("Model") and isDungeonModel(m) then
+				for _, q in ipairs(gridFor(m)) do
+					add(q, 200)
+				end
+			end
+		end
+	end
+	for _, off in ipairs({ 0, 500, -500, 1000, -1000, 1500, -1500, 2000, -2000 }) do
+		local x = x0
+		while x <= x1 do
+			add(Vector3.new(x, 4, rz + off), 300)
+			x = x + 700
+		end
+	end
+	for _, m in ipairs(Workspace:GetChildren()) do
+		if m:IsA("Model") and not SKIP_MODELS[m.Name] and m ~= LocalPlayer.Character and not string.find(m.Name, "_CameraFocus", 1, true) then
+			local p = posOf(m)
+			if p then
+				add(p, 300)
+			end
+		end
+	end
+	return list
+end
+
+local function rememberOres()
+	local of = Workspace:FindFirstChild("Ores")
+	if not of then
+		return
+	end
+	for _, o in ipairs(of:GetChildren()) do
+		local p = posOf(o)
+		if p and oreHealth(o) > 0 then
+			Hub.OreMem[o.Name .. "|" .. r1(p.X) .. "|" .. r1(p.Z)] = { t = sessionTypeOf(o), x = r1(p.X), y = r1(p.Y), z = r1(p.Z) }
+		end
+	end
+end
+
+local function requestStream(pos)
+	pulse(pos)
+	task.wait(Config.StreamWait)
+	return true
+end
+
+-- konumlari Config.StreamBatch'lik gruplar halinde ayni anda ister; stepFn(pos) true donerse tarama durur
+local function sweepStream(stepFn, stopFn)
+	local list = streamPositions()
+	Hub.SweepTotal = #list
+	local back, moved = nil, false
+	local result = true
+	local i = 1
+	while i <= #list do
+		if not State.running or (stopFn and stopFn()) then
+			result = false
+			break
+		end
+		local last = math.min(i + Config.StreamBatch - 1, #list)
+		for k = i, last do
+			pulse(list[k])
+		end
+		if Hub.SweepTeleport then
+			if not moved then
+				back = tpSave()
+				moved = true
+			end
+			tpToPos(list[i], 6)
+		end
+		task.wait(Config.StreamWait)
+		Hub.SweepIdx = last
+		rememberOres()
+		if stepFn then
+			local ok, stop = pcall(stepFn, list[i])
+			if ok and stop == true then
+				result = true
+				break
+			end
+		end
+		i = last + 1
+	end
+	if moved then
+		tpBack(back)
+	end
+	return result
+end
+
+-- Stream tutucu: hedef cevher uzaksa o bolgeyi yuklu tut
+task.spawn(function()
+	while State.running do
+		if Config.StreamKeep and not _G.HubBusy then
+			local t = State.target
+			local p = t and t.Parent and posOf(t)
+			if p and (p - charPivot()).Magnitude > 350 then
+				pulse(p)
+			end
+		end
+		task.wait(1.2)
+	end
+end)
+
+local function oreNear(p, r)
+	local f = Workspace:FindFirstChild("Ores")
+	if not f then
+		return false
+	end
+	for _, o in ipairs(f:GetChildren()) do
+		local op = posOf(o)
+		if op and (op - p).Magnitude <= r and isOreEnabled(sessionTypeOf(o)) and oreHealth(o) > 0 then
+			return true
+		end
+	end
+	return false
+end
+
+local function bestRememberedOre()
+	local me = charPivot()
+	local bestKey, bestPos, bd = nil, nil, nil
+	for key, o in pairs(Hub.OreMem) do
+		if isOreEnabled(o.t) and not (Hub.OreSkip[key] and os.clock() - Hub.OreSkip[key] < 60) then
+			local p = Vector3.new(o.x, o.y, o.z)
+			local d = (p - me).Magnitude
+			if d > 150 and (bd == nil or d < bd) then
+				bestKey, bestPos, bd = key, p, d
+			end
+		end
+	end
+	return bestKey, bestPos, bd
+end
+
+-- Workspace.Ores'ta uygun cevher yoksa: hafizadaki (veya taramayla bulunan) en yakin cevhere git
+local function gotoRecordedOre()
+	if _G.HubBusy then
+		return false
+	end
+	local bestKey, bestPos, bd = bestRememberedOre()
+	if not bestKey and os.clock() - (Hub.LastOreSweep or 0) > Config.OreSweepEvery then
+		if not acquire("ore-sweep") then
+			return false
+		end
+		Hub.LastOreSweep = os.clock()
+		State.status = T("cevherler araniyor (harita taramasi)")
+		sweepStream(function()
+			touchBusy()
+			if Config.MapRecord then
+				pcall(recordScan)
+			end
+			return false
+		end, function()
+			return not Config.AutoMine
+		end)
+		release()
+		bestKey, bestPos, bd = bestRememberedOre()
+	end
+	if not bestKey or not acquire("ore-travel") then
+		return false
+	end
+	State.status = T("cevhere gidiyor ") .. math.floor(bd) .. "m"
+	tpToPos(bestPos, 6)
+	local t0 = os.clock()
+	local found = false
+	while os.clock() - t0 < 6 and State.running do
+		task.wait(0.3)
+		touchBusy()
+		if oreNear(bestPos, 400) then
+			found = true
+			break
+		end
+	end
+	Hub.OreSkip[bestKey] = os.clock()
+	if not found then
+		Hub.OreMem[bestKey] = nil
+	end
+	release()
+	return found
+end
+
+-- ===== Anti-Streaming: surekli, ayni anda cok konum =====
+task.spawn(function()
+	local list, builtAt, idx, lastD = {}, 0, 0, false
+	while State.running do
+		if Config.AntiStream and isAlive() then
+			local inD = LocalPlayer:GetAttribute("InDungeon") == true
+			if inD ~= lastD or #list == 0 or os.clock() - builtAt > (inD and 3 or 20) then
+				lastD = inD
+				list = streamPositions()
+				builtAt = os.clock()
+				idx = 0
+			end
+			local n = #list
+			if n > 0 then
+				local cnt = math.min(n, inD and 40 or Config.StreamBatch)
+				for _ = 1, cnt do
+					idx = idx % n + 1
+					pulse(list[idx])
+				end
+			end
+			task.wait(math.max(0.1, inD and math.min(Config.PulseEvery, 1) or Config.PulseEvery))
+		else
+			task.wait(1)
+		end
+	end
+end)
+
+-- cevher hafizasi: her Config.ScanTick'te yuklu cevherleri kaydet
+task.spawn(function()
+	while State.running do
+		pcall(rememberOres)
+		task.wait(math.max(0.1, Config.ScanTick))
+	end
+end)
+
+-- ===== Oto maden =====
+task.spawn(function()
+	while State.running do
+		if Config.AutoMine and not _G.HubBusy then
+			if not isAlive() then
+				State.status = T("Olusun - duraklatildi")
+				State.target = nil
+				task.wait(1)
+			else
+				-- onceki cevher bittiyse say
+				local last = State.lastOre
+				if last and (not last.Parent or oreHealth(last) <= 0) then
+					State.mined = State.mined + 1
+					State.lastOre = nil
+				end
+				local ore, dist = findNearestOre()
+				State.target = ore
+				State.targetDist = dist or 0
+				if ore then
+					State.lastOre = ore
+					State.status = sessionTypeOf(ore) .. " | " .. math.floor(dist) .. "m"
+					ensurePickaxe()
+					swingAt(ore)
+					task.wait(Config.HitDelay)
+				else
+					local f = Workspace:FindFirstChild("Ores")
+					State.status = T("Hedef yok (") .. (f and #f:GetChildren() or 0) .. T(" node)")
+					if not gotoRecordedOre() then
+						task.wait(math.max(0.1, Config.ScanTick))
+					end
+				end
+			end
+		else
+			State.target = nil
+			if not Config.AutoMine then
+				State.status = T("Mining kapali")
+			end
+			task.wait(0.4)
+		end
+	end
+end)
+
+-- ===== Oto toplama (uzaktan cantaya; olmazsa yanina isinlanir) =====
+-- Canli test: Pickup remote'u mesafe siniri olmadan calisiyor (23000+ stud, 0.13sn).
+local function pickupCandidates(fuelOnly, maxRange)
+	local list = {}
+	local items = Workspace:FindFirstChild("Items")
+	if not items then
+		return list
+	end
+	local myPos = charPivot()
+	local dung = dungeonPositions()
+	local inDungeon = LocalPlayer:GetAttribute("InDungeon") == true
+	for _, it in ipairs(items:GetChildren()) do
+		if canStore(it) and not recentlyFailed(it) and not Hub.Dropped[it] and (not fuelOnly or isFuelItem(it)) then
+			local p = posOf(it)
+			if p then
+				local d = (p - myPos).Magnitude
+				if d <= maxRange then
+					local pri = 2
+					if inDungeon then
+						pri = 1
+					else
+						for _, dp in ipairs(dung) do
+							if (dp - p).Magnitude < 250 then
+								pri = 1
+								break
+							end
+						end
+					end
+					list[#list + 1] = { it = it, d = d, pri = pri }
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.pri ~= b.pri then
+			return a.pri < b.pri
+		end
+		return a.d > b.d
+	end)
+	return list
+end
+
+local function dumpBag()
+	local drop = drillDumpPos()
+	if not drop then
+		Hub.PickStatus = T("drill yok")
+		return false
+	end
+	local itemsF = Workspace:FindFirstChild("Items")
+	local before = {}
+	if itemsF then
+		for _, it in ipairs(itemsF:GetChildren()) do
+			before[it] = true
+		end
+	end
+	local back = tpSave()
+	tpToPos(drop, 6)
+	task.wait(0.7)
+	local svc = getToolService()
+	pcall(function()
+		svc.Update:Fire({ "DropAll" })
+	end)
+	local t0 = os.clock()
+	while os.clock() - t0 < 5 do
+		task.wait(0.2)
+		local s = bagInfo()
+		if s == 0 then
+			break
+		end
+	end
+	task.wait(0.5)
+	if itemsF then
+		for _, it in ipairs(itemsF:GetChildren()) do
+			if not before[it] then
+				Hub.Dropped[it] = true
+			end
+		end
+	end
+	tpBack(back)
+	Hub.PickDumped = (Hub.PickDumped or 0) + 1
+	return true
+end
+
+-- yuklu esyalari topla; (toplanan, canta_dolu_ve_bosaltma_kapali)
+-- Boru hatli: sunucu ~0.15-0.2sn'de bir toplamaya izin veriyor (canli test: 0.2sn aralikta 2/2, 0.12sn'de 1/2).
+-- Esyalar Config.PickupInterval araliginda arka arkaya atilir, sonra dogrulanir, kacirilanlar tekrar denenir.
+local function pickPass()
+	local n = 0
+	local list = pickupCandidates(Hub.FuelAuto, Config.PickupRange)
+	local i = 1
+	while i <= #list do
+		if not State.running or not isAlive() or not Config.AutoPickup then
+			break
+		end
+		local s, m = bagInfo()
+		if s == nil then
+			ensureBag()
+			s, m = bagInfo()
+		end
+		if s and m and s >= m then
+			if Hub.AutoDump and dumpBag() then
+				ensureBag()
+				s, m = bagInfo()
+				if s and m and s >= m then
+					return n, true
+				end
+			else
+				return n, true
+			end
+		end
+		local room = (s and m) and (m - s) or 5
+		if room < 1 then
+			room = 1
+		end
+		local batch = {}
+		while #batch < room and #batch < 8 and i <= #list do
+			if list[i].it.Parent then
+				batch[#batch + 1] = list[i]
+			end
+			i = i + 1
+		end
+		local svc = getToolService()
+		for _, e in ipairs(batch) do
+			if not State.running or not Config.AutoPickup then
+				break
+			end
+			pcall(function()
+				svc.Update:Fire({ "Pickup", e.it })
+			end)
+			task.wait(Config.PickupInterval)
+		end
+		local t0 = os.clock()
+		while os.clock() - t0 < 0.8 do
+			local all = true
+			for _, e in ipairs(batch) do
+				if e.it.Parent then
+					all = false
+					break
+				end
+			end
+			if all then
+				break
+			end
+			task.wait(0.05)
+		end
+		for _, e in ipairs(batch) do
+			local it = e.it
+			local ok = it.Parent == nil
+			if not ok then
+				local s2, m2 = bagInfo()
+				if s2 and m2 and s2 >= m2 then
+					-- canta dolu: basarisiz sayma, dongu basinda bosaltilir
+					list = pickupCandidates(Hub.FuelAuto, Config.PickupRange)
+					i = 1
+					break
+				end
+				ok = bagPickup(it, 1.0)
+			end
+			if not ok and it.Parent and Config.PickupTp then
+				local p = posOf(it)
+				if p then
+					local back = tpSave()
+					tpToPos(p, 3)
+					task.wait(0.5)
+					ok = bagPickup(it, 2.0)
+					tpBack(back)
+				end
+			end
+			if ok then
+				n = n + 1
+				State.picked = State.picked + 1
+				Hub.PickLast = it.Name .. " " .. math.floor(e.d) .. "m"
+			elseif it.Parent then
+				Hub.Fail[it] = os.clock()
+			end
+		end
+		touchBusy()
+	end
+	return n, false
+end
+
+task.spawn(function()
+	local lastSweep = 0
+	while State.running do
+		local waitT = math.max(0.1, Config.ScanTick)
+		if Config.AutoPickup and isAlive() then
+			local loaded = #pickupCandidates(Hub.FuelAuto, Config.PickupRange)
+			local sweepDue = os.clock() - lastSweep > Config.PickupSweepEvery
+			if (loaded > 0 or sweepDue) and not _G.HubBusy and acquire("pickup") then
+				local total = 0
+				local fullStop = false
+				pcall(function()
+					if not ensureBag() then
+						Hub.PickStatus = T("canta yok")
+						return
+					end
+					local n, full = pickPass()
+					total = total + n
+					fullStop = full
+					if sweepDue and not fullStop then
+						lastSweep = os.clock()
+						sweepStream(function()
+							Hub.PickStatus = T("tarama ") .. tostring(Hub.SweepIdx) .. "/" .. tostring(Hub.SweepTotal) .. T(" alinan ") .. total
+							local n2, f2 = pickPass()
+							total = total + n2
+							touchBusy()
+							if Config.MapRecord then
+								pcall(recordScan)
+							end
+							if f2 then
+								fullStop = true
+								return true
+							end
+							return false
+						end, function()
+							return not Config.AutoPickup
+						end)
+					end
+					if fullStop then
+						Hub.PickStatus = T("canta dolu")
+					else
+						Hub.PickStatus = T("alindi: ") .. total .. T(" (son: ") .. tostring(Hub.PickLast) .. ")"
+					end
+				end)
+				release()
+				if fullStop then
+					waitT = 15
+				end
+			end
+		else
+			waitT = 1
+		end
+		task.wait(waitT)
+	end
+end)
+
+-- ===== Oto kart (arka planda) =====
+local function applyCardResult(c, res, id)
+	if typeof(res) ~= "table" or res.Success ~= true or res.ClaimedOfferId ~= id then
+		Hub.CardStatus = T("reddedildi")
+		return
+	end
+	local uiOpen = false
+	pcall(function()
+		uiOpen = c.UpgradeUI ~= nil and c.UpgradeUI.Enabled == true
+	end)
+	if uiOpen then
+		pcall(function()
+			c:HandleClassRewardChoiceResult(res, id)
+		end)
+		return
+	end
+	if c.ActiveClassReward and c.ActiveClassReward.Id == id then
+		c.ActiveClassReward = nil
+	end
+	c.LastClaimedClassRewardOfferId = math.max(c.LastClaimedClassRewardOfferId or 0, id)
+	pcall(function()
+		c:SetPurchasePending(false)
+	end)
+	if res.NextOffer then
+		pcall(function()
+			c:ReceiveClassRewardOffer(res.NextOffer, false)
+		end)
+	end
+end
+
+local awaitPromise
+awaitPromise = function(p, timeout)
+	if type(p) ~= "table" or not p.andThen then
+		return p
+	end
+	local done, val = false, nil
+	p:andThen(function(a)
+		val = a
+		done = true
+	end):catch(function()
+		done = true
+	end)
+	local t0 = os.clock()
+	while not done and os.clock() - t0 < (timeout or 3) do
+		task.wait(0.05)
+	end
+	return val
+end
+
+local CardCache = { coins = 0, at = 0 }
+local function getCoins()
+	if os.clock() - CardCache.at > 0.4 then
+		local cs = service("CurrencyService")
+		if cs then
+			local v = tonumber(awaitPromise(cs:GetCurrency(), 2))
+			if v then
+				CardCache.coins = v
+			end
+		end
+		CardCache.at = os.clock()
+	end
+	return CardCache.coins
+end
+
+local function cardStep()
+	local c = ctrl("DrillUpgradeController")
+	if not c then
+		Hub.CardStatus = T("teklif yok")
+		return false
+	end
+	local offer = c.ActiveClassReward
+	-- 1) ucretsiz sinif odulu
+	if offer and typeof(offer.Id) == "number" and typeof(offer.Options) == "table" then
+		local lastTry = Hub.CardTry[offer.Id]
+		if not lastTry or os.clock() - lastTry > 4 then
+			local best, bestRank = nil, 1e9
+			for _, op in ipairs(offer.Options) do
+				local nm = nil
+				if typeof(op) == "string" then
+					nm = op
+				elseif typeof(op) == "table" then
+					nm = op.UpgradeName or op.Name
+				end
+				if nm and Hub.CardOn[nm] ~= false then
+					local r = Hub.CardRank[nm] or 99
+					if r < bestRank then
+						best, bestRank = nm, r
+					end
+				end
+			end
+			if best then
+				Hub.CardTry[offer.Id] = os.clock()
+				Hub.CardStatus = best
+				local id = offer.Id
+				local svc = service("DrillService")
+				local ok, r = pcall(function()
+					return svc:ChooseClassReward(id, best)
+				end)
+				if ok then
+					if typeof(r) == "table" and r.andThen then
+						pcall(function()
+							r:andThen(function(res)
+								applyCardResult(c, res, id)
+							end):catch(function() end)
+						end)
+					else
+						applyCardResult(c, r, id)
+					end
+				end
+				return true
+			end
+			Hub.CardStatus = T("filtre disi")
+		end
+		-- sinif odulu filtre disi/bekliyor: normal kartlara da bak
+	end
+	-- 2) normal kartlar: siradaki en iyi, bakiyesi yeten karti SATIN AL
+	local opts = c.Options
+	if type(opts) ~= "table" or #opts == 0 then
+		if not offer then
+			Hub.CardStatus = T("teklif yok")
+		end
+		return false
+	end
+	if c.PurchasePending or c.OptionsFetchPending then
+		return false
+	end
+	local ds = service("DrillService")
+	if not ds then
+		return false
+	end
+	local coins = getCoins()
+	local best, bestRank = nil, 1e9
+	for _, op in ipairs(opts) do
+		if type(op) == "table" and op.Type ~= "Robux" and op.UpgradeName and Hub.CardOn[op.UpgradeName] ~= false then
+			local cost = tonumber(op.Cost) or 0
+			if cost <= coins then
+				local r = Hub.CardRank[op.UpgradeName] or 99
+				if r < bestRank then
+					best, bestRank = op, r
+				end
+			end
+		end
+	end
+	if not best then
+		Hub.CardStatus = T("uygun/yeterli kart yok") .. " (" .. tostring(coins) .. ")"
+		return false
+	end
+	local ok = awaitPromise(ds:UpgradeDrill(best.UpgradeName, c.OptionsVersion), 3)
+	CardCache.at = 0
+	Hub.CardStatus = (ok == true and T("satin alindi: ") or T("satin alinamadi: ")) .. best.UpgradeName .. " (" .. tostring(best.Cost) .. ")"
+	return ok == true
+end
+
+task.spawn(function()
+	while State.running do
+		if Hub.AutoCard then
+			local ok, did = pcall(cardStep)
+			if not ok then
+				Hub.CardStatus = T("hata: ") .. tostring(did)
+				did = false
+			end
+			task.wait(did and 0.2 or math.max(0.1, Config.ScanTick))
+		else
+			task.wait(0.5)
+		end
+	end
+end)
+
+-- ===== Larry: goblin cesetlerini ayri topla -> Larry'ye birak -> madalya ile kartlari (upgrade) satin al =====
+-- LarryConfig.Corpses: Goblin1-3, Goblin_Loot, Goblin_Poison, Goblin4-5, Goblin_Brute, Goblin_Knight, Goblin_Lord, Goblin_Champion
+-- (Void on ekli olanlar dahil). Madalya = deger/10. Satin alma icin Larry'nin 20 stud yakininda olmak gerekiyor.
+local LarryConfigMod = nil
+pcall(function()
+	LarryConfigMod = require(ReplicatedStorage.Shared.LarryConfig)
+end)
+
+local function larryStation()
+	local st = RealWorkspace:FindFirstChild("LieutenantLarrys")
+	if st and st.Parent then
+		return st
+	end
+	for _, m in ipairs(RealWorkspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name == "LieutenantLarrys" then
+			return m
+		end
+	end
+	return nil
+end
+
+local function larryCollectPart(st)
+	for _, p in ipairs(CollectionService:GetTagged("LarryCollector")) do
+		if p:IsA("BasePart") then
+			return p
+		end
+	end
+	local p = st and st:FindFirstChild("CorpseCollect", true)
+	if p and p:IsA("BasePart") then
+		return p
+	end
+	return nil
+end
+
+local function larryAnchor(st)
+	local part = larryCollectPart(st) or st:FindFirstChild("LarrySpawn", true)
+	if not part then
+		local l = st:FindFirstChild("Lieutenant Larry", true)
+		part = l and l:FindFirstChild("HumanoidRootPart")
+	end
+	if part and part:IsA("BasePart") then
+		return part.Position
+	end
+	local ss = st:FindFirstChild("SellSpot", true)
+	return posOf(ss or st)
+end
+
+-- istasyona tam isinlan (once bolgeyi yukle, sonra gercek parcaya git)
+local function goToLarry(st)
+	local est = posOf(st:FindFirstChild("SellSpot", true) or st)
+	if not est then
+		return nil
+	end
+	tpToPos(est, 8)
+	local t0 = os.clock()
+	while os.clock() - t0 < 5 do
+		pulse(est)
+		task.wait(0.3)
+		touchBusy()
+		if larryCollectPart(st) then
+			break
+		end
+	end
+	local pos = larryAnchor(st)
+	if pos then
+		tpToPos(pos, 4)
+	end
+	return pos
+end
+
+local function larryState()
+	local svc = service("LarryService")
+	if not svc then
+		return nil
+	end
+	local ok, st = pcall(function()
+		return awaitPromise(svc:GetState(), 3)
+	end)
+	if ok and type(st) == "table" then
+		return st
+	end
+	return nil
+end
+
+-- Larry'nin yaninda: satin alinabilir her karti siraya gore al
+local function buyLarryUpgrades(st)
+	local svc = service("LarryService")
+	local state = larryState()
+	if not svc or not state or not state.Available then
+		Hub.LarryStatus = T("durum alinamadi")
+		return 0
+	end
+	local bought = 0
+	for _ = 1, 40 do
+		local progressed = false
+		for _, id in ipairs(Hub.LarryRank) do
+			if not State.running then
+				return bought
+			end
+			local cost = (LarryConfigMod and LarryConfigMod.Upgrades[id] and LarryConfigMod.Upgrades[id].Cost) or 0
+			if Hub.LarryOn[id] ~= false and state.Available[id] and (state.Medals or 0) >= cost then
+				Hub.LarryStatus = T("aliniyor: ") .. id
+				local ok = awaitPromise(svc:BuyUpgrade(id, st), 3)
+				touchBusy()
+				state = larryState() or state
+				if ok then
+					bought = bought + 1
+					progressed = true
+				end
+				break
+			end
+		end
+		if not progressed then
+			break
+		end
+	end
+	if bought > 0 then
+		Hub.LarryStatus = T("alinan kart: ") .. bought .. " | " .. T("madalya: ") .. tostring(state.Medals or 0)
+	else
+		Hub.LarryStatus = T("madalya: ") .. tostring(state.Medals or 0)
+	end
+	return bought
+end
+
+local function isGoblinCorpse(it)
+	if it:GetAttribute("Category") ~= "Corpse" and GA(it, "Category") ~= "Corpse" then
+		return false
+	end
+	if typeof(it:GetAttribute("CorpsePlayerUserId")) == "number" then
+		return false
+	end
+	local rn = it:GetAttribute("RealName")
+	if LarryConfigMod and type(rn) == "string" then
+		return LarryConfigMod.GetCorpse(rn) ~= nil
+	end
+	return string.find(it.Name, "Goblin", 1, true) ~= nil
+end
+
+local function corpseList()
+	local list, seen = {}, {}
+	local me = charPivot()
+	local function add(it)
+		if seen[it] or not it.Parent or not isGoblinCorpse(it) or recentlyFailed(it) then
+			return
+		end
+		seen[it] = true
+		local p = posOf(it)
+		if p then
+			local def = LarryConfigMod and LarryConfigMod.GetCorpse(it:GetAttribute("RealName") or "")
+			list[#list + 1] = { it = it, d = (p - me).Magnitude, v = (def and def.Value) or 1 }
+		end
+	end
+	local items = RealWorkspace:FindFirstChild("Items")
+	if items then
+		for _, it in ipairs(items:GetChildren()) do
+			add(it)
+		end
+	end
+	for it in pairs(World.corpses) do
+		add(it)
+	end
+	table.sort(list, function(a, b)
+		if a.v ~= b.v then
+			return a.v > b.v
+		end
+		return a.d < b.d
+	end)
+	return list
+end
+
+-- bir cesedi surukleyip Larry'ye birak
+local function deliverCorpse(corpse, st)
+	local dc = ctrl("DragController")
+	if not dc then
+		Hub.CorpseStatus = T("DragController yok")
+		return false
+	end
+	local cp = posOf(corpse)
+	if not cp then
+		return false
+	end
+	local before = (larryState() or {}).Medals or 0
+	tpToPos(cp, 3)
+	task.wait(0.6)
+	local locked = false
+	for _try = 1, 3 do
+		pcall(function()
+			dc:TryLockTarget(corpse)
+		end)
+		local t1 = os.clock()
+		while os.clock() - t1 < 1.5 do
+			if dc.LockedTarget == corpse then
+				locked = true
+				break
+			end
+			task.wait(0.1)
+		end
+		if locked then
+			break
+		end
+	end
+	if not locked then
+		Hub.CorpseStatus = T("tutma olmadi: ") .. corpse.Name
+		return false
+	end
+	local cpart = larryCollectPart(st)
+	local ssp = st:FindFirstChild("SellSpot", true)
+	local dest = cpart and cpart.Position or ((ssp and posOf(ssp) or larryAnchor(st) or posOf(st)) + Vector3.new(0, 4, 0))
+	local conn = RunService.Stepped:Connect(function()
+		if dc.LockedTarget == corpse then
+			pcall(function()
+				dc:Toggle(nil, dest)
+			end)
+		end
+	end)
+	tpToPos(dest, 5)
+	local t2 = os.clock()
+	local arrived = false
+	while os.clock() - t2 < 7 and State.running do
+		task.wait(0.2)
+		if not corpse.Parent then
+			arrived = true
+			break
+		end
+		local ip = posOf(corpse)
+		if ip and (ip - dest).Magnitude < 9 then
+			arrived = true
+			break
+		end
+		touchBusy()
+	end
+	task.wait(0.8)
+	conn:Disconnect()
+	pcall(function()
+		dc:ReleaseLockedTarget(true)
+	end)
+	task.wait(1.2)
+	local after = (larryState() or {}).Medals or before
+	local ok = (not corpse.Parent) or after > before
+	Hub.CorpseStatus = (ok and T("teslim: ") or T("teslim edilemedi: ")) .. corpse.Name .. " (+" .. tostring(after - before) .. ")"
+	if not ok then
+		Hub.Fail[corpse] = os.clock()
+	end
+	return ok and arrived
+end
+
+task.spawn(function()
+	local lastStateAt, canBuyCached = 0, false
+	while State.running do
+		local ok, err = pcall(function()
+			if not ((Hub.CorpseAuto or Hub.LarryAuto) and isAlive()) or _G.HubBusy then
+				return
+			end
+			local st = larryStation()
+			if not st then
+				Hub.LarryStatus = T("istasyon yok")
+				Hub.CorpseStatus = T("istasyon yok")
+				return
+			end
+			local list = corpseList()
+			if Hub.LarryAuto and os.clock() - lastStateAt > 1 then
+				lastStateAt = os.clock()
+				canBuyCached = false
+				local state = larryState()
+				if state and state.Available then
+					for _, id in ipairs(Hub.LarryRank) do
+						local cost = (LarryConfigMod and LarryConfigMod.Upgrades[id] and LarryConfigMod.Upgrades[id].Cost) or 0
+						if Hub.LarryOn[id] ~= false and state.Available[id] and (state.Medals or 0) >= cost then
+							canBuyCached = true
+							break
+						end
+					end
+					if not canBuyCached then
+						Hub.LarryStatus = T("madalya: ") .. tostring(state.Medals or 0)
+					end
+				end
+			end
+			if (#list > 0 or (Hub.LarryAuto and canBuyCached)) and acquire("larry") then
+				local back = tpSave()
+				pcall(function()
+					for _, e in ipairs(list) do
+						if not State.running or not isAlive() then
+							break
+						end
+						if e.it.Parent and deliverCorpse(e.it, st) then
+							Hub.CorpseDone = Hub.CorpseDone + 1
+						end
+						touchBusy()
+					end
+					if Hub.LarryAuto then
+						goToLarry(st)
+						task.wait(0.5)
+						buyLarryUpgrades(st)
+					end
+				end)
+				canBuyCached = false
+				lastStateAt = 0
+				tpBack(back)
+				release()
+			elseif #list == 0 then
+				Hub.CorpseStatus = T("goblin cesedi yok")
+			end
+		end)
+		if not ok then
+			Hub.LarryStatus = T("hata: ") .. tostring(err)
+		end
+		task.wait(math.max(0.1, Config.ScanTick))
+	end
+end)
+
+-- ===== Oto yakit =====
+local function nearestFuel(fromPos)
+	local items = Workspace:FindFirstChild("Items")
+	if not items then
+		return nil
+	end
+	local best, bd = nil, 1e12
+	for _, it in ipairs(items:GetChildren()) do
+		if isFuelItem(it) and Hub.FuelOn[it.Name] ~= false and canStore(it) and not recentlyFailed(it) then
+			local p = posOf(it)
+			if p then
+				local d = (p - fromPos).Magnitude
+				if d < bd then
+					best, bd = it, d
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function fuelCandidates()
+	local list = {}
+	local items = Workspace:FindFirstChild("Items")
+	if not items then
+		return list
+	end
+	local me = charPivot()
+	for _, it in ipairs(items:GetChildren()) do
+		if it.Parent and isFuelItem(it) and Hub.FuelOn[it.Name] ~= false and canStore(it) and not recentlyFailed(it) and not Hub.Dropped[it] then
+			local p = posOf(it)
+			if p then
+				list[#list + 1] = { it = it, d = (p - me).Magnitude, f = GA(it, "Fuel") or 0 }
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.f ~= b.f then
+			return a.f > b.f
+		end
+		return a.d < b.d
+	end)
+	return list
+end
+
+-- canta dolana kadar yakit topla: en cok yakit veren once, arka arkaya (boru hatli), haritanin her yerinden
+local function collectFuel()
+	if not ensureBag() then
+		Hub.FuelStatus = T("canta yok")
+		return 0
+	end
+	local got = 0
+	while State.running and isAlive() do
+		local size, max = bagInfo()
+		if size == nil then
+			ensureBag()
+			size, max = bagInfo()
+		end
+		if size and max and size >= max then
+			break
+		end
+		local list = fuelCandidates()
+		if #list == 0 then
+			Hub.FuelStatus = T("yakit araniyor (harita taramasi)")
+			local found = false
+			sweepStream(function()
+				touchBusy()
+				if #fuelCandidates() > 0 then
+					found = true
+					return true
+				end
+				return false
+			end)
+			if found then
+				list = fuelCandidates()
+			end
+		end
+		if #list == 0 then
+			break
+		end
+		local room = (size and max) and (max - size) or 5
+		local batch = {}
+		for i = 1, math.min(#list, math.max(1, math.min(room, 8))) do
+			batch[#batch + 1] = list[i]
+		end
+		local svc = getToolService()
+		for _, e in ipairs(batch) do
+			Hub.FuelStatus = T("topluyor ") .. e.it.Name
+			pcall(function()
+				svc.Update:Fire({ "Pickup", e.it })
+			end)
+			task.wait(Config.PickupInterval)
+		end
+		local t0 = os.clock()
+		while os.clock() - t0 < 0.8 do
+			local all = true
+			for _, e in ipairs(batch) do
+				if e.it.Parent then
+					all = false
+					break
+				end
+			end
+			if all then
+				break
+			end
+			task.wait(0.05)
+		end
+		for _, e in ipairs(batch) do
+			local it = e.it
+			local ok = it.Parent == nil
+			if not ok then
+				ok = bagPickup(it, 1.0)
+			end
+			if not ok and it.Parent then
+				local p = posOf(it)
+				if p then
+					tpToPos(p, 3)
+					task.wait(0.5)
+					ok = bagPickup(it, 2.0)
+				end
+			end
+			if ok then
+				got = got + 1
+			elseif it.Parent then
+				Hub.Fail[it] = os.clock()
+			end
+		end
+		touchBusy()
+	end
+	return got
+end
+
+-- drill'in ortasina gidip yakit dolana (veya canta bosalana) kadar HEMEN birak (DropAll)
+local function dropFuel()
+	local drop = drillDumpPos()
+	if not drop then
+		Hub.FuelStatus = T("drill yok")
+		return
+	end
+	tpToPos(drop, 6)
+	task.wait(0.3)
+	ensureBag()
+	local _, f0 = drillFuelPct()
+	local svc = getToolService()
+	local itemsF = Workspace:FindFirstChild("Items")
+	local before = {}
+	if itemsF then
+		for _, it in ipairs(itemsF:GetChildren()) do
+			before[it] = true
+		end
+	end
+	for _ = 1, 4 do
+		if not State.running or not isAlive() then
+			break
+		end
+		if drillFuelPct() >= 99 then
+			break
+		end
+		local size = bagInfo()
+		if not size or size <= 0 then
+			break
+		end
+		Hub.FuelStatus = T("birakiyor")
+		pcall(function()
+			svc.Update:Fire({ Config.FuelFast and "DropAll" or "Drop" })
+		end)
+		local t0 = os.clock()
+		while os.clock() - t0 < 1.5 do
+			task.wait(0.1)
+			local s = bagInfo()
+			if s and s < size and Config.FuelFast and s == 0 then
+				break
+			elseif s and s < size and not Config.FuelFast then
+				break
+			end
+		end
+		touchBusy()
+	end
+	if itemsF then
+		task.wait(0.3)
+		for _, it in ipairs(itemsF:GetChildren()) do
+			if not before[it] then
+				Hub.Dropped[it] = true
+			end
+		end
+	end
+	local _, f1 = drillFuelPct()
+	Hub.FuelDone = Hub.FuelDone + math.max(0, math.floor(f1 - f0))
+end
+
+task.spawn(function()
+	while State.running do
+		if Hub.FuelAuto and isAlive() then
+			local pct = drillFuelPct()
+			if pct < Hub.FuelPct and not _G.HubBusy then
+				if acquire("fuel") then
+					pcall(function()
+						local back = tpSave()
+						for _ = 1, 4 do
+							if not State.running or drillFuelPct() >= 99 then
+								break
+							end
+							ensureBag()
+							local size = bagInfo()
+							if size and size > 0 then
+								dropFuel()
+							else
+								local got = collectFuel()
+								if got == 0 then
+									Hub.FuelStatus = T("yakit yok")
+									break
+								end
+							end
+						end
+						tpBack(back)
+					end)
+					release()
+				end
+			elseif pct >= Hub.FuelPct then
+				Hub.FuelStatus = T("depo yeterli")
+			end
+			task.wait(math.max(0.1, Config.ScanTick))
+		else
+			task.wait(1)
+		end
+	end
+end)
+
+-- ===== Oto shop (cursor'suz surukleme) =====
+local function findBuyPart(nearPos, radius)
+	local best, bd = nil, radius
+	for _, p in ipairs(CollectionService:GetTagged("BuyPart")) do
+		if p:IsA("BasePart") then
+			local d = (p.Position - nearPos).Magnitude
+			if d < bd then
+				best, bd = p, d
+			end
+		end
+	end
+	return best
+end
+
+local function shopBuy(item)
+	local ipos = posOf(item)
+	if not ipos then
+		return
+	end
+	-- 1) once isinlan, kasa (BuyPart) stream olsun
+	tpToPos(ipos, 4)
+	task.wait(1.2)
+	local bp = nil
+	local t0 = os.clock()
+	while os.clock() - t0 < 8 and State.running do
+		bp = findBuyPart(ipos, 500)
+		if bp then
+			break
+		end
+		tpToPos(ipos, 4)
+		task.wait(0.5)
+		touchBusy()
+	end
+	if not bp then
+		Hub.ShopStatus = T("kasa yok: ") .. item.Name
+		Hub.ShopBought[item] = true
+		return
+	end
+	local dc = ctrl("DragController")
+	if not dc then
+		Hub.ShopStatus = T("DragController yok")
+		return
+	end
+	ensureBag() -- canta surukleme engellemez
+	-- 2) kilitle
+	local locked = false
+	for _try = 1, 3 do
+		pcall(function()
+			dc:TryLockTarget(item)
+		end)
+		local t1 = os.clock()
+		while os.clock() - t1 < 2 do
+			if dc.LockedTarget == item then
+				locked = true
+				break
+			end
+			task.wait(0.1)
+		end
+		if locked then
+			break
+		end
+	end
+	if not locked then
+		Hub.ShopStatus = T("tutma olmadi: ") .. item.Name
+		return
+	end
+	-- 3) esyayi kasaya surukle (Stepped: oyunun kendi dongusunden sonra, fizikten once)
+	local target = bp.Position + Vector3.new(0, 2, 0)
+	local conn = RunService.Stepped:Connect(function()
+		if dc.LockedTarget == item then
+			pcall(function()
+				dc:Toggle(nil, target)
+			end)
+		end
+	end)
+	tpToPos(bp.Position, 6)
+	local placed = false
+	local t2 = os.clock()
+	while os.clock() - t2 < 7 and State.running do
+		task.wait(0.2)
+		local ip = posOf(item)
+		if ip and (ip - bp.Position).Magnitude < 8 then
+			placed = true
+			break
+		end
+		touchBusy()
+	end
+	task.wait(0.4)
+	conn:Disconnect()
+	pcall(function()
+		dc:ReleaseLockedTarget(true)
+	end)
+	task.wait(0.6)
+	Hub.ShopStatus = placed and (T("goturuldu: ") .. item.Name) or (T("yerlesmedi: ") .. item.Name)
+	-- 4) satin al
+	pcall(function()
+		service("ShopService"):Buy(bp)
+	end)
+	Hub.ShopDone = Hub.ShopDone + 1
+	Hub.ShopBought[item] = true
+	task.wait(1.5)
+	-- 5) aldigimiz esyayi bul
+	local gotT = findTool(function(t)
+		return t.Name == item.Name
+	end)
+	if gotT then
+		Hub.ShopStatus = T("elde: ") .. gotT.Name
+	else
+		local bpp = bp.Position
+		local got, gotD = nil, 40
+		local items = Workspace:FindFirstChild("Items")
+		if items then
+			for _, it in ipairs(items:GetChildren()) do
+				if it ~= item and it.Name == item.Name and canStore(it) then
+					local q = posOf(it)
+					if q and (q - bpp).Magnitude < gotD then
+						got, gotD = it, (q - bpp).Magnitude
+					end
+				end
+			end
+		end
+		if got and GA(got, "Tool") == true then
+			local isvc = service("InteractionService")
+			tpToPos(posOf(got), 3)
+			task.wait(0.5)
+			for _ = 1, 3 do
+				if not got.Parent then
+					break
+				end
+				pcall(function()
+					isvc:Interact(got)
+				end)
+				task.wait(0.9)
+			end
+			Hub.ShopStatus = T("elde: ") .. got.Name
+		elseif got and ensureBag() and bagPickup(got) then
+			Hub.ShopStatus = T("cantaya alindi: ") .. got.Name
+		end
+	end
+end
+
+task.spawn(function()
+	while State.running do
+		if Hub.ShopAuto and isAlive() and not _G.HubBusy then
+			local myPos = charPivot()
+			local best, bestD = nil, 1e12
+			for _, it in ipairs(CollectionService:GetTagged("ShopItem")) do
+				if Hub.ShopOn[it.Name] ~= false and not Hub.ShopBought[it] and (it:IsA("BasePart") or it:IsA("Model")) then
+					local p = posOf(it)
+					if p then
+						local dd = (p - myPos).Magnitude
+						if dd < bestD and dd <= (Hub.ShopRange or 100000) then
+							best, bestD = it, dd
+						end
+					end
+				end
+			end
+			if best then
+				if acquire("shop") then
+					local back = tpSave()
+					local ok, err = pcall(shopBuy, best)
+					if not ok then
+						Hub.ShopStatus = T("hata: ") .. tostring(err)
+						Hub.ShopBought[best] = true
+					end
+					tpBack(back)
+					release()
+				end
+			else
+				Hub.ShopStatus = T("esya yok")
+			end
+			task.wait(3)
+		else
+			task.wait(1)
+		end
+	end
+end)
+
+-- ===== Oto heal (medkit'i kendi bulur/alir, kendine ve takim arkadaslarina kullanir) =====
+local function medkitTool()
+	return (findTool(isMedkitTool))
+end
+
+local function acquireMedkit()
+	if medkitTool() then
+		return true
+	end
+	if not Config.HealGet then
+		return false
+	end
+	-- 1) yerde duran bedava medkit (Items'in tum alt dallari)
+	local items = Workspace:FindFirstChild("Items")
+	local best, bd = nil, 1e12
+	local me = charPivot()
+	if items then
+		for _, it in ipairs(items:GetChildren()) do
+			if it.Parent and GA(it, "Class") == "Medkit" and not CollectionService:HasTag(it, "ShopItem") and canStore(it) and not recentlyFailed(it) then
+				local p = posOf(it)
+				if p then
+					local d = (p - me).Magnitude
+					if d < bd then
+						best, bd = it, d
+					end
+				end
+			end
+		end
+	end
+	if best then
+		if _G.HubBusy or not acquire("heal-get") then
+			return false
+		end
+		local ok = false
+		pcall(function()
+			local back = tpSave()
+			tpToPos(posOf(best), 3)
+			task.wait(0.7)
+			local isvc = service("InteractionService")
+			for _ = 1, 3 do
+				if not best.Parent then
+					break
+				end
+				pcall(function()
+					isvc:Interact(best)
+				end)
+				task.wait(1.0)
+				if medkitTool() then
+					break
+				end
+			end
+			ok = medkitTool() ~= nil
+			if not ok then
+				Hub.Fail[best] = os.clock()
+			end
+			tpBack(back)
+		end)
+		release()
+		Hub.HealStatus = ok and T("medkit alindi") or T("medkit alinamadi")
+		return ok
+	end
+	-- 2) shop'tan en ucuzunu satin al
+	local cheapest, cc = nil, 1e12
+	for _, it in ipairs(CollectionService:GetTagged("ShopItem")) do
+		if GA(it, "Class") == "Medkit" and not Hub.ShopBought[it] then
+			local cost = tonumber(it:GetAttribute("Cost")) or 1e9
+			if cost < cc then
+				cheapest, cc = it, cost
+			end
+		end
+	end
+	if cheapest and not _G.HubBusy and acquire("heal-buy") then
+		Hub.HealStatus = T("shop'tan aliniyor: ") .. cheapest.Name
+		local back = tpSave()
+		pcall(shopBuy, cheapest)
+		tpBack(back)
+		release()
+		return medkitTool() ~= nil
+	end
+	return false
+end
+
+task.spawn(function()
+	while State.running do
+		if Hub.HealAuto then
+			local did = false
+			if Hub.SelfHeal and isAlive() and not _G.HubBusy then
+				local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+				if hum and hum.MaxHealth > 0 and hum.Health > 0 and (hum.Health / hum.MaxHealth * 100) < Hub.HealPct then
+					if medkitTool() or acquireMedkit() then
+						if not _G.HubBusy and acquire("heal-self") then
+							pcall(function()
+								if ensureToolMatch(isMedkitTool) then
+									for _ = 1, 14 do
+										local h2 = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+										if not h2 or h2.Health <= 0 or h2.Health >= h2.MaxHealth or (h2.Health / h2.MaxHealth * 100) >= Hub.HealPct + 25 then
+											break
+										end
+										if not medkitTool() then
+											break
+										end
+										getToolService().Update:Fire({ "Consume" })
+										Hub.HealStatus = T("kendim")
+										did = true
+										task.wait(0.6)
+										touchBusy()
+									end
+								end
+							end)
+							release()
+						end
+					end
+				end
+			end
+			if not did and isAlive() then
+				for _, p in ipairs(Players:GetPlayers()) do
+					if not State.running then
+						break
+					end
+					if p ~= LocalPlayer and p.Character then
+						local hum = p.Character:FindFirstChildOfClass("Humanoid")
+						if hum and hum.Health > 0 and hum.MaxHealth > 0 and (hum.Health / hum.MaxHealth * 100) < Hub.HealPct then
+							if (medkitTool() or acquireMedkit()) and ensureToolMatch(isMedkitTool) and acquire("heal") then
+								local back = tpSave()
+								local pp = posOf(p.Character)
+								if pp then
+									tpToPos(pp, 4)
+									task.wait(0.6)
+									pcall(function()
+										getToolService().Update:Fire({ "HealTarget", p.Character })
+									end)
+									Hub.HealStatus = p.Name
+									task.wait(2.5)
+								end
+								tpBack(back)
+								release()
+								did = true
+								break
+							end
+						end
+					end
+				end
+			end
+			if not did and Hub.HealStatus ~= T("medkit alinamadi") then
+				Hub.HealStatus = T("herkes saglikli")
+			end
+			task.wait(math.max(0.1, Config.ScanTick))
+		else
+			task.wait(1)
+		end
+	end
+end)
+
+-- ===== En iyi esyayi kusan (slot slot) =====
+local function gearCandidates()
+	local items = Workspace:FindFirstChild("Items")
+	local list = {}
+	if not items then
+		return list
+	end
+	local best = currentBest()
+	local myPos = charPivot()
+	for _, it in ipairs(items:GetChildren()) do
+		if canStore(it) and not recentlyFailed(it) then
+			local slot = slotOf(it)
+			if slot then
+				local p = posOf(it)
+				if p and (p - myPos).Magnitude <= Hub.GearRange then
+					local s = scoreOf(it, slot)
+					local cur = best[slot]
+					if cur == nil or s > cur then
+						list[#list + 1] = { it = it, s = s, slot = slot, d = (p - myPos).Magnitude, cur = cur }
+					end
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.slot == b.slot then
+			return a.s > b.s
+		end
+		return a.d < b.d
+	end)
+	return list
+end
+
+task.spawn(function()
+	while State.running do
+		if Hub.GearAuto and isAlive() and not _G.HubBusy then
+			local list = gearCandidates()
+			local e = list[1]
+			if e then
+				if acquire("gear") then
+					pcall(function()
+						local it = e.it
+						local p = posOf(it)
+						if not p or not it.Parent then
+							return
+						end
+						Hub.GearBest = it.Name .. " (" .. math.floor(e.s) .. ")"
+						local back = tpSave()
+						tpToPos(p, 3)
+						task.wait(1)
+						local svc = service("InteractionService")
+						for _ = 1, 2 do
+							if not it.Parent then
+								break
+							end
+							pcall(function()
+								svc:Interact(it)
+							end)
+							task.wait(1.2)
+						end
+						local after = currentBest()[e.slot]
+						if after and after >= e.s - 0.0001 then
+							Hub.GearStatus = T("kusandi: ") .. it.Name
+						else
+							Hub.GearStatus = T("kusanilamadi: ") .. it.Name
+							Hub.Fail[it] = os.clock()
+						end
+						tpBack(back)
+					end)
+					release()
+				end
+			else
+				Hub.GearStatus = T("daha iyi esya yok")
+			end
+			task.wait(5)
+		else
+			task.wait(1)
+		end
+	end
+end)
+
+-- ===== Bekci: takili kilit =====
+task.spawn(function()
+	while State.running do
+		task.wait(2)
+		if _G.HubBusy and Hub._BusySince and os.clock() - Hub._BusySince > 120 then
+			_G.HubBusy = false
+			Hub.Busy = false
+			Hub._BusySince = nil
+			print(T("[Hub] takili kilit acildi"))
+		end
+	end
+end)
+
+-- ===== Anti-void =====
+task.spawn(function()
+	while State.running do
+		task.wait(2)
+		if isAlive() and not _G.HubBusy then
+			local h = hrp()
+			if h then
+				local rp = RaycastParams.new()
+				rp.FilterType = Enum.RaycastFilterType.Exclude
+				rp.FilterDescendantsInstances = { LocalPlayer.Character }
+				local hit = Workspace:Raycast(h.Position, Vector3.new(0, -12, 0), rp)
+				if hit then
+					Hub._SafeCF = h.CFrame
+				elseif Hub.AntiFall then
+					local lim = Workspace.FallenPartsDestroyHeight + 100
+					if h.Position.Y < lim then
+						if Hub._SafeCF then
+							h.CFrame = Hub._SafeCF
+						else
+							local d = Workspace:FindFirstChild("Drill")
+							local pp = d and posOf(d)
+							if pp then
+								h.CFrame = CFrame.new(pp + Vector3.new(0, 8, 0))
+							end
+						end
+						h.AssemblyLinearVelocity = Vector3.zero
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- ===== Shop kumeleri (Shop butonlari icin) =====
+local function computeShops()
+	local clusters = {}
+	for _, it in ipairs(CollectionService:GetTagged("ShopItem")) do
+		local p = posOf(it)
+		if p then
+			local placed = false
+			for _, c in ipairs(clusters) do
+				if (c.center - p).Magnitude <= 150 then
+					c.sum = c.sum + p
+					c.n = c.n + 1
+					c.center = c.sum / c.n
+					placed = true
+					break
+				end
+			end
+			if not placed then
+				clusters[#clusters + 1] = { sum = p, n = 1, center = p }
+			end
+		end
+	end
+	table.sort(clusters, function(a, b)
+		if math.abs(a.center.X - b.center.X) > 150 then
+			return a.center.X < b.center.X
+		end
+		return a.center.Y < b.center.Y
+	end)
+	return clusters
+end
+
+-- ===== Hareket: Ucma / Sinirsiz ziplama / NoClip / God Mode + mobil butonlar =====
+local FEATURES = { "Fly", "InfJump", "NoClip", "God" }
+local FEATURE_LABEL = { Fly = "Ucma", InfJump = "Sinirsiz ziplama", NoClip = "NoClip", God = "God Mode" }
+
+local function featureOn(name)
+	if name == "Fly" then
+		return Config.Fly
+	elseif name == "InfJump" then
+		return Config.InfJump
+	elseif name == "NoClip" then
+		return Config.NoClip
+	elseif name == "God" then
+		return Config.GodMode
+	end
+	return false
+end
+
+local Mobile = { gui = nil, buttons = {} }
+
+local function refreshMobile()
+	for name, btn in pairs(Mobile.buttons) do
+		if btn.Parent then
+			local on = featureOn(name)
+			btn.BackgroundColor3 = on and Color3.fromRGB(46, 160, 90) or Color3.fromRGB(60, 60, 72)
+			btn.Text = T(FEATURE_LABEL[name]) .. (on and "  [ON]" or "  [OFF]")
+		end
+	end
+end
+
+local function setFeature(name, v, fromUI)
+	v = v and true or false
+	if name == "Fly" then
+		Config.Fly = v
+		local ch = LocalPlayer.Character
+		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+		if hum then
+			pcall(function()
+				hum.PlatformStand = v
+			end)
+		end
+	elseif name == "InfJump" then
+		Config.InfJump = v
+	elseif name == "NoClip" then
+		Config.NoClip = v
+	elseif name == "God" then
+		Config.GodMode = v
+	end
+	if not fromUI then
+		local hd = Hub.UIHandles[name]
+		if hd then
+			pcall(function()
+				hd:Set(v, true)
+			end)
+		end
+	end
+	refreshMobile()
+end
+
+local function toggleFeature(name)
+	setFeature(name, not featureOn(name), false)
+end
+
+local function destroyMobile()
+	if Mobile.gui then
+		pcall(function()
+			Mobile.gui:Destroy()
+		end)
+	end
+	Mobile.gui = nil
+	Mobile.buttons = {}
+end
+
+local function buildMobile()
+	destroyMobile()
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "OreFarmMobile"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	pcall(function()
+		gui.DisplayOrder = 999
+	end)
+	local okP, parent = pcall(function()
+		if typeof(gethui) == "function" then
+			return gethui()
+		end
+		return game:GetService("CoreGui")
+	end)
+	local ok2 = pcall(function()
+		gui.Parent = (okP and parent) or game:GetService("CoreGui")
+	end)
+	if not ok2 then
+		gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	end
+	local holder = Instance.new("Frame")
+	holder.BackgroundTransparency = 1
+	holder.AnchorPoint = Vector2.new(1, 0.5)
+	holder.Position = UDim2.new(1, -8, 0.5, 0)
+	holder.Size = UDim2.new(0, 160, 0, #FEATURES * 52)
+	holder.Parent = gui
+	for i, name in ipairs(FEATURES) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, 0, 0, 46)
+		b.Position = UDim2.new(0, 0, 0, (i - 1) * 52)
+		b.AutoButtonColor = true
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.TextSize = 14
+		b.Font = Enum.Font.GothamBold
+		b.BorderSizePixel = 0
+		b.Parent = holder
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 8)
+		c.Parent = b
+		b.Activated:Connect(function()
+			toggleFeature(name)
+		end)
+		Mobile.buttons[name] = b
+	end
+	Mobile.gui = gui
+	refreshMobile()
+end
+
+local function setMobile(on)
+	Config.MobileButtons = on and true or false
+	if on then
+		buildMobile()
+	else
+		destroyMobile()
+	end
+end
+
+-- eski calistirmadan kalan mobil buton arayuzunu temizle
+pcall(function()
+	for _, root in ipairs({ game:GetService("CoreGui"), (typeof(gethui) == "function") and gethui() or nil, LocalPlayer:FindFirstChild("PlayerGui") }) do
+		local old = root and root:FindFirstChild("OreFarmMobile")
+		if old then
+			old:Destroy()
+		end
+	end
+end)
+
+-- NoClip (manuel) + Ucma, fizikten once (Stepped)
+addConn(RunService.Stepped:Connect(function()
+	if not State.running then
+		return
+	end
+	if Config.NoClip then
+		local ch = LocalPlayer.Character
+		if ch then
+			for _, p in ipairs(ch:GetDescendants()) do
+				if p:IsA("BasePart") and p.CanCollide then
+					p.CanCollide = false
+				end
+			end
+		end
+		Hub._MoveNoClip = true
+	elseif Hub._MoveNoClip then
+		Hub._MoveNoClip = false
+		local ch = LocalPlayer.Character
+		if ch and not Config.GodMode and not Hub._NoClip then
+			for _, n in ipairs(MAIN_PARTS) do
+				local p = ch:FindFirstChild(n)
+				if p and p:IsA("BasePart") then
+					p.CanCollide = true
+				end
+			end
+		end
+	end
+end))
+
+-- Ucma: CFrame tabanli, yumusak hizlanma; tus birakilinca havada SABIT kalir (suzulme yok)
+local FlyS = { vel = Vector3.zero, hold = nil }
+addConn(RunService.Heartbeat:Connect(function(dt)
+	if not State.running then
+		return
+	end
+	local mining = Config.AutoMine and Config.Float and State.target and State.target.Parent
+	if not (Config.Fly and isAlive()) or _G.HubBusy or mining then
+		FlyS.vel = Vector3.zero
+		FlyS.hold = nil
+		return
+	end
+	local h = hrp()
+	local ch = LocalPlayer.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	local cam = Workspace.CurrentCamera
+	if not (h and hum and cam) then
+		return
+	end
+	local typing = UserInputService:GetFocusedTextBox() ~= nil
+	local dir = Vector3.zero
+	if not typing then
+		local cf = cam.CFrame
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+			dir = dir + cf.LookVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+			dir = dir - cf.LookVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+			dir = dir + cf.RightVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+			dir = dir - cf.RightVector
+		end
+	end
+	if dir.Magnitude < 0.1 and hum.MoveDirection.Magnitude > 0.1 then
+		dir = hum.MoveDirection
+	end
+	local vy = 0
+	if not typing then
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+			vy = 1
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+			vy = -1
+		end
+	end
+	if hum.Jump then
+		vy = 1
+	end
+	local desired = Vector3.zero
+	if dir.Magnitude > 0.1 then
+		desired = dir.Unit * Config.FlySpeed
+	end
+	desired = desired + Vector3.new(0, vy * Config.FlySpeed, 0)
+	local a = 1 - math.exp(-14 * dt)
+	FlyS.vel = FlyS.vel:Lerp(desired, a)
+	if desired.Magnitude < 0.1 and FlyS.vel.Magnitude < 2 then
+		-- hedef hiz sifir: oldugun yerde havada kilitle
+		FlyS.vel = Vector3.zero
+		if not FlyS.hold then
+			FlyS.hold = h.CFrame
+		end
+		h.CFrame = FlyS.hold
+	else
+		h.CFrame = h.CFrame + FlyS.vel * dt
+		FlyS.hold = h.CFrame
+	end
+	h.AssemblyLinearVelocity = Vector3.zero
+	h.AssemblyAngularVelocity = Vector3.zero
+end))
+
+-- Sinirsiz ziplama
+addConn(UserInputService.JumpRequest:Connect(function()
+	if Config.InfJump and isAlive() then
+		local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end
+end))
+
+-- yeniden dogunca ucma durumunu geri uygula
+addConn(LocalPlayer.CharacterAdded:Connect(function(ch)
+	task.wait(0.6)
+	if Config.Fly and State.running then
+		local hum = ch:FindFirstChildOfClass("Humanoid")
+		if hum then
+			pcall(function()
+				hum.PlatformStand = true
+			end)
+		end
+	end
+end))
+
+-- ===== Shop / Satis / Hurda noktalari (dinamik: 100k'dan sonra sayi azalir/degisir) =====
+local KIND_TAG = { Shop = "BuyPart", Sell = "SellPart", Scrap = "ScrapCollector" }
+-- Kale kok noktasina gore olculen konumlar (Start kalesi: kok 374,-1,-771 | BuyPart 377,7,-670 | SellPart 385-399,8,-865 | Hurda 518,7,-822)
+local KIND_OFF = { Shop = Vector3.new(3, 8, 101), Sell = Vector3.new(18, 9, -94), Scrap = Vector3.new(144, 8, -51) }
+local KIND_LABEL = { Shop = "Shop", Sell = "Satis", Scrap = "Hurda" }
+
+local function fortressModels()
+	local list = {}
+	local chunks = RealWorkspace:FindFirstChild("Chunks")
+	local fs = chunks and chunks:FindFirstChild("Fortresses")
+	if fs then
+		for _, f in ipairs(fs:GetChildren()) do
+			if f:IsA("Model") then
+				local p = posOf(f)
+				if p then
+					list[#list + 1] = { m = f, p = p }
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.p.X < b.p.X
+	end)
+	return list
+end
+
+-- secenek adi -> kayit
+local function buildSpots()
+	local map, names = {}, {}
+	for _, f in ipairs(fortressModels()) do
+		local short = string.gsub(f.m.Name, "^Fortress_", "")
+		for _, kind in ipairs({ "Shop", "Sell", "Scrap" }) do
+			local nm = T(KIND_LABEL[kind]) .. ": " .. short
+			map[nm] = { fort = f.m, kind = kind }
+			names[#names + 1] = nm
+		end
+	end
+	-- kalelerin disinda kalan satis noktalari (ornek: egitim kampi)
+	for _, p in ipairs(CollectionService:GetTagged("SellPart")) do
+		if p:IsA("BasePart") then
+			local top = topChild(p)
+			local tn = top.Name
+			if tn ~= "Chunks" and string.sub(tn, 1, 8) ~= "CutScene" then
+				local nm = T("Satis") .. ": " .. tn
+				if not map[nm] then
+					map[nm] = { pos = p.Position }
+					names[#names + 1] = nm
+				end
+			end
+		end
+	end
+	return map, names
+end
+
+local function gotoSpot(e)
+	if not e or not acquire("spot-tp") then
+		return
+	end
+	pcall(function()
+		local target
+		if e.fort then
+			local root = posOf(e.fort)
+			local est = root + KIND_OFF[e.kind]
+			local function find()
+				local best, bd = nil, 1e12
+				for _, p in ipairs(CollectionService:GetTagged(KIND_TAG[e.kind])) do
+					if p:IsA("BasePart") and p:IsDescendantOf(e.fort) then
+						local d = (p.Position - est).Magnitude
+						if d < bd then
+							best, bd = p, d
+						end
+					end
+				end
+				return best
+			end
+			local part = find()
+			if not part then
+				tpToPos(est, 10)
+				local t0 = os.clock()
+				while os.clock() - t0 < 5 and not part do
+					pulse(est)
+					task.wait(0.25)
+					part = find()
+					touchBusy()
+				end
+			end
+			target = part and part.Position or est
+		else
+			target = e.pos
+		end
+		tpToPos(target, 5)
+	end)
+	-- float / otomasyon 15sn bu noktada beklesin
+	Hub.BusyTag = "spot-tp"
+	task.delay(15, function()
+		if Hub.BusyTag == "spot-tp" then
+			release()
+		end
+	end)
+end
+
+-- ===== UI =====
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+local window = nil
+Hub.UIGen = 0
+
+local function destroyUI()
+	pcall(function()
+		if window and window.Destroy then
+			window:Destroy()
+		end
+	end)
+	for _, root in ipairs({ game:GetService("CoreGui"), (typeof(gethui) == "function") and gethui() or nil }) do
+		pcall(function()
+			for _, d in ipairs(root:GetDescendants()) do
+				if d.Name == "Ore Farm" and d:IsA("Frame") then
+					local top = d.Parent
+					pcall(function()
+						top:Destroy()
+					end)
+				end
+			end
+		end)
+	end
+	window = nil
+end
+
+local prevStop = _G.__OreFarmStop
+_G.__OreFarmStop = function()
+	pcall(destroyMobile)
+	pcall(prevStop)
+end
+
+local SCAN_PRESETS = {
+	{ 8, 1.4 },
+	{ 12, 1.2 },
+	{ 16, 1.0 },
+	{ 24, 0.85 },
+	{ 32, 0.7 },
+}
+
+local buildUI
+buildUI = function()
+	Hub.UIGen = Hub.UIGen + 1
+	local gen = Hub.UIGen
+	local function alive()
+		return State.running and Hub.UIGen == gen
+	end
+	Hub.FuelToggles = {}
+	Hub.ShopToggles = {}
+	Hub.UIHandles = {}
+
+	window = Rayfield:CreateWindow({ name = "Ore Farm", subtitle = "Auto Mine + Auto Bag v6.2", sidebarLayout = true })
+	_G.__OreFarmWindow = window
+	local tabMine = window:CreateTab({ name = T("Maden") })
+	local tabScan = window:CreateTab({ name = T("Tarama") })
+	local tabMove = window:CreateTab({ name = T("Hareket") })
+	local tabOre = window:CreateTab({ name = T("Cevherler") })
+	local tabUp = window:CreateTab({ name = T("Upgrade") })
+	local tabFuel = window:CreateTab({ name = T("Yakit") })
+	local tabShop = window:CreateTab({ name = T("Shop") })
+	local tabHeal = window:CreateTab({ name = T("Heal") })
+	local tabGear = window:CreateTab({ name = T("Gear") })
+	local tabSet = window:CreateTab({ name = T("Ayarlar") })
+
+	-- ---------- Maden ----------
+	tabMine:CreateToggle({ name = T("Oto Maden (float + vur)"), value = Config.AutoMine, callback = function(v)
+		Config.AutoMine = v
+		if v then
+			_G.HubBusy = false
+			Hub._BusySince = nil
+		end
+	end })
+	tabMine:CreateToggle({ name = T("Oto Toplama (uzaktan, isinlanmadan)"), value = Config.AutoPickup, callback = function(v)
+		Config.AutoPickup = v
+	end })
+	tabMine:CreateToggle({ name = T("Canta dolunca drill'e bosalt"), value = Hub.AutoDump, callback = function(v)
+		Hub.AutoDump = v
+	end })
+	tabMine:CreateToggle({ name = T("Float (cevhere yaklas, havada kilitli kal)"), value = Config.Float, callback = function(v)
+		Config.Float = v
+		if not v then
+			Hub.HoldCF = nil
+		end
+	end })
+	tabMine:CreateSlider({ name = T("Cevher menzili"), range = { 100, 200000 }, increment = 100, value = Config.OreRange, suffix = "m", callback = function(v)
+		Config.OreRange = v
+	end })
+	tabMine:CreateSlider({ name = T("Float yuksekligi (cevher merkezine gore)"), range = { -10, 6 }, increment = 1, value = Config.FloatHeight, suffix = "m", callback = function(v)
+		Config.FloatHeight = v
+	end })
+	tabMine:CreateSlider({ name = T("Cevhere uzaklik"), range = { 0, 8 }, increment = 1, value = Config.StandOff, suffix = "m", callback = function(v)
+		Config.StandOff = v
+	end })
+	tabMine:CreateSlider({ name = T("Vurus araligi"), range = { 20, 150 }, increment = 5, value = math.floor(Config.HitDelay * 100 + 0.5), suffix = "msx10", callback = function(v)
+		Config.HitDelay = v / 100
+	end })
+	tabMine:CreateToggle({ name = T("Anti-fall (bosluk)"), value = Hub.AntiFall, callback = function(v)
+		Hub.AntiFall = v
+	end })
+	tabMine:CreateSlider({ name = T("Bosaltma konumu (drill ortasina kaydir)"), range = { 0, 20 }, increment = 1, value = Config.DumpShift, suffix = "m", callback = function(v)
+		Config.DumpShift = v
+	end })
+
+	local statCount = tabMine:CreateStat({ name = T("Kasilan"), value = State.mined })
+	local statDist = tabMine:CreateStat({ name = T("Mesafe"), value = 0 })
+	local statPick = tabMine:CreateStat({ name = T("Toplanan"), value = State.picked })
+	local consMine = tabMine:CreateConsole({ name = T("Durum"), follow = true, maxLines = 20 })
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				statCount:Set(State.mined)
+				statDist:Set(math.floor(State.targetDist or 0))
+				statPick:Set(State.picked)
+				local s = State.status .. " | " .. Hub.PickStatus .. " | " .. Hub.MapStatus .. (Hub.BusyTag and (" | [" .. Hub.BusyTag .. "]") or "")
+				if s ~= Hub._LastMine then
+					Hub._LastMine = s
+					consMine:Append(s)
+				end
+			end)
+			task.wait(0.5)
+		end
+	end)
+
+	tabMine:CreateButton({ name = T("Cevherleri tara (isimleri yazdir)"), callback = function()
+		local seen = {}
+		local f = Workspace:FindFirstChild("Ores")
+		if f then
+			for _, o in ipairs(f:GetChildren()) do
+				local st = sessionTypeOf(o)
+				if st ~= "" then
+					seen[st] = (seen[st] or 0) + 1
+				end
+			end
+		end
+		for k, c in pairs(seen) do
+			print("[ORE]", k, "x" .. c)
+		end
+	end })
+
+	-- ---------- Tarama ----------
+	tabScan:CreateToggle({ name = T("Anti-Streaming (haritayi yuklu tut)"), value = Config.AntiStream, callback = function(v)
+		Config.AntiStream = v
+	end })
+	tabScan:CreateToggle({ name = T("Harita kaydet (her 100000m blok)"), value = Config.MapRecord, callback = function(v)
+		Config.MapRecord = v
+	end })
+	tabScan:CreateToggle({ name = T("Stream tutucu (uzak hedefi yuklu tut)"), value = Config.StreamKeep, callback = function(v)
+		Config.StreamKeep = v
+	end })
+	tabScan:CreateToggle({ name = T("Zindan 3B tarama"), value = Config.DungeonGrid, callback = function(v)
+		Config.DungeonGrid = v
+	end })
+	tabScan:CreateSlider({ name = T("Tarama araligi (esya/cevher/yakit/techizat)"), range = { 10, 200 }, increment = 5, value = math.floor(Config.ScanTick * 100 + 0.5), suffix = "/100s", callback = function(v)
+		Config.ScanTick = v / 100
+	end })
+	tabScan:CreateSlider({ name = T("Tarama butcesi (ms/kare)"), range = { 1, 10 }, increment = 1, value = Config.ScanBudget, suffix = "ms", callback = function(v)
+		Config.ScanBudget = v
+	end })
+	tabScan:CreateSlider({ name = T("Harita yukleme istegi araligi"), range = { 10, 200 }, increment = 5, value = math.floor(Config.PulseEvery * 100 + 0.5), suffix = "/100s", callback = function(v)
+		Config.PulseEvery = v / 100
+	end })
+	local batchSlider
+	tabScan:CreateSlider({ name = T("Tarama hizi (1 yavas - 5 cok hizli)"), range = { 1, 5 }, increment = 1, value = Config.ScanSpeed, callback = function(v)
+		Config.ScanSpeed = v
+		local p = SCAN_PRESETS[v]
+		if p then
+			Config.StreamBatch = p[1]
+			Config.StreamWait = p[2]
+			if batchSlider then
+				pcall(function()
+					batchSlider:Set(p[1], true)
+				end)
+			end
+		end
+	end })
+	batchSlider = tabScan:CreateSlider({ name = T("Stream dalga boyutu"), range = { 4, 32 }, increment = 1, value = Config.StreamBatch, callback = function(v)
+		Config.StreamBatch = v
+	end })
+	tabScan:CreateSlider({ name = T("Cevher arama sikligi (sn)"), range = { 2, 60 }, increment = 1, value = Config.OreSweepEvery, suffix = "s", callback = function(v)
+		Config.OreSweepEvery = v
+	end })
+	tabScan:CreateSlider({ name = T("Toplama taramasi sikligi (sn)"), range = { 3, 60 }, increment = 1, value = Config.PickupSweepEvery, suffix = "s", callback = function(v)
+		Config.PickupSweepEvery = v
+	end })
+	tabScan:CreateSlider({ name = T("Toplama hizi (esyalar arasi sn)"), range = { 10, 50 }, increment = 1, value = math.floor(Config.PickupInterval * 100 + 0.5), suffix = "/100s", callback = function(v)
+		Config.PickupInterval = v / 100
+	end })
+	tabScan:CreateSlider({ name = T("Toplama menzili"), range = { 10, 100000 }, increment = 100, value = Config.PickupRange, suffix = "m", callback = function(v)
+		Config.PickupRange = v
+	end })
+	tabScan:CreateToggle({ name = T("Tarama sirasinda isinlan (yedek)"), value = Hub.SweepTeleport, callback = function(v)
+		Hub.SweepTeleport = v
+	end })
+	tabScan:CreateToggle({ name = T("Alinamayan esyanin yanina isinlan"), value = Config.PickupTp, callback = function(v)
+		Config.PickupTp = v
+	end })
+
+	-- ---------- Hareket ----------
+	local function addKey(name)
+		local props = {
+			name = T("Tus ata: ") .. T(FEATURE_LABEL[name]),
+			flag = "ore_key_" .. name,
+			forgetState = true,
+			callback = function()
+				toggleFeature(name)
+			end,
+			onChanged = function(k)
+				SavedKeys[name] = k and k.Name or nil
+				saveSettings()
+			end,
+		}
+		local saved = SavedKeys[name]
+		if saved then
+			local okK, kc = pcall(function()
+				return Enum.KeyCode[saved]
+			end)
+			if okK and kc then
+				props.value = kc
+			end
+		end
+		tabMove:CreateKeybind(props)
+	end
+
+	Hub.UIHandles.Fly = tabMove:CreateToggle({ name = T("Ucma"), value = Config.Fly, callback = function(v)
+		setFeature("Fly", v, true)
+	end })
+	addKey("Fly")
+	tabMove:CreateSlider({ name = T("Ucma hizi"), range = { 10, 300 }, increment = 5, value = Config.FlySpeed, callback = function(v)
+		Config.FlySpeed = v
+	end })
+	Hub.UIHandles.InfJump = tabMove:CreateToggle({ name = T("Sinirsiz ziplama"), value = Config.InfJump, callback = function(v)
+		setFeature("InfJump", v, true)
+	end })
+	addKey("InfJump")
+	Hub.UIHandles.NoClip = tabMove:CreateToggle({ name = T("NoClip"), value = Config.NoClip, callback = function(v)
+		setFeature("NoClip", v, true)
+	end })
+	addKey("NoClip")
+	Hub.UIHandles.God = tabMove:CreateToggle({ name = T("God Mode (yer alti float)"), value = Config.GodMode, callback = function(v)
+		setFeature("God", v, true)
+	end })
+	addKey("God")
+	tabMove:CreateSlider({ name = T("God Mode yukseklik"), range = { -30, 30 }, increment = 1, value = Config.GodOffset, suffix = "m", callback = function(v)
+		Config.GodOffset = v
+	end })
+	tabMove:CreateToggle({ name = T("Mobil butonlar"), description = T("Acinca ekranda Ucma / Ziplama / NoClip / God butonlari gorunur"), value = Config.MobileButtons, callback = function(v)
+		setMobile(v)
+	end })
+
+	-- ---------- Cevherler ----------
+	local function oreToggle(base, label)
+		tabOre:CreateToggle({ name = label, value = Config.Ores[base] == true, callback = function(v)
+			Config.Ores[base] = v
+		end })
+	end
+	oreToggle("coal", "Coal")
+	oreToggle("iron", "Iron")
+	oreToggle("gold", "Gold")
+	oreToggle("diamond", "Diamond")
+	oreToggle("emerald", "Emerald")
+	oreToggle("ruby", "Ruby")
+	oreToggle("voidcoal", "VoidCoal")
+	oreToggle("heartgem", "Heartgem")
+	tabOre:CreateButton({ name = T("Tumunu ac"), callback = function()
+		for k in pairs(Config.Ores) do
+			Config.Ores[k] = true
+		end
+	end })
+	tabOre:CreateButton({ name = T("Tumunu kapat"), callback = function()
+		for k in pairs(Config.Ores) do
+			Config.Ores[k] = false
+		end
+	end })
+
+	-- ---------- Upgrade ----------
+	tabUp:CreateToggle({ name = T("Oto kart sec (en iyi)"), value = Hub.AutoCard, callback = function(v)
+		Hub.AutoCard = v
+	end })
+	local statCard = tabUp:CreateConsole({ name = T("Durum"), follow = true, maxLines = 20 })
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				if Hub.CardStatus ~= Hub._LastCard then
+					Hub._LastCard = Hub.CardStatus
+					statCard:Append(Hub.CardStatus)
+				end
+			end)
+			task.wait(1)
+		end
+	end)
+	do
+		local order = {}
+		for nm, r in pairs(Hub.CardRank) do
+			order[#order + 1] = { nm = nm, r = r }
+		end
+		table.sort(order, function(a, b)
+			return a.r < b.r
+		end)
+		for _, e in ipairs(order) do
+			local nm = e.nm
+			tabUp:CreateToggle({ name = e.r .. ". " .. nm, value = Hub.CardOn[nm] ~= false, callback = function(v)
+				Hub.CardOn[nm] = v
+			end })
+		end
+	end
+	tabUp:CreateToggle({ name = T("Oto Larry (goblin birak + kart al)"), value = Hub.LarryAuto, callback = function(v)
+		Hub.LarryAuto = v
+	end })
+	for _, id in ipairs(Hub.LarryRank) do
+		tabUp:CreateToggle({ name = id, value = Hub.LarryOn[id] ~= false, callback = function(v)
+			Hub.LarryOn[id] = v
+		end })
+	end
+	tabUp:CreateToggle({ name = T("Sadece goblinleri Larry'ye tasi (kart almadan)"), value = Hub.CorpseAuto, callback = function(v)
+		Hub.CorpseAuto = v
+	end })
+	local statLarry = tabUp:CreateConsole({ name = T("Larry durumu"), follow = true, maxLines = 20 })
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local s2 = Hub.LarryStatus .. " | " .. Hub.CorpseStatus .. " (" .. Hub.CorpseDone .. ")"
+				if s2 ~= Hub._LastLarry then
+					Hub._LastLarry = s2
+					statLarry:Append(s2)
+				end
+			end)
+			task.wait(1)
+		end
+	end)
+
+	-- ---------- Yakit ----------
+	tabFuel:CreateToggle({ name = T("Oto yakit (topla + birak)"), value = Hub.FuelAuto, callback = function(v)
+		Hub.FuelAuto = v
+	end })
+	tabFuel:CreateSlider({ name = T("Yakit esigi"), range = { 5, 95 }, increment = 5, value = Hub.FuelPct, suffix = "%", callback = function(v)
+		Hub.FuelPct = v
+	end })
+	tabFuel:CreateToggle({ name = T("Aninda doldur (hepsini birden birak)"), value = Config.FuelFast, callback = function(v)
+		Config.FuelFast = v
+	end })
+	local statFuel = tabFuel:CreateConsole({ name = T("Durum"), follow = true, maxLines = 20 })
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local s = Hub.FuelStatus .. " (" .. Hub.FuelDone .. ")"
+				if s ~= Hub._LastFuel then
+					Hub._LastFuel = s
+					statFuel:Append(s)
+				end
+			end)
+			task.wait(1)
+		end
+	end)
+	local function addFuelToggle(nm)
+		if Hub.FuelToggles[nm] == nil then
+			if Hub.FuelOn[nm] == nil then
+				Hub.FuelOn[nm] = true
+			end
+			Hub.FuelToggles[nm] = tabFuel:CreateToggle({ name = nm, flag = "f_" .. nm .. "_" .. tostring(math.floor(os.clock() * 100)), value = Hub.FuelOn[nm] ~= false, callback = function(v)
+				Hub.FuelOn[nm] = v
+			end })
+		end
+	end
+	tabFuel:CreateButton({ name = T("Yakitlari tara"), callback = function()
+		local seen = {}
+		local items = Workspace:FindFirstChild("Items")
+		if items then
+			for _, it in ipairs(items:GetChildren()) do
+				if isFuelItem(it) then
+					seen[it.Name] = (seen[it.Name] or 0) + 1
+					addFuelToggle(it.Name)
+				end
+			end
+		end
+		for k, c in pairs(seen) do
+			print("[FUEL]", k, "x" .. c)
+		end
+	end })
+
+	-- ---------- Shop ----------
+	tabShop:CreateToggle({ name = T("Oto satin al"), value = Hub.ShopAuto, callback = function(v)
+		Hub.ShopAuto = v
+	end })
+	local statShop = tabShop:CreateConsole({ name = T("Durum"), follow = true, maxLines = 20 })
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local s = Hub.ShopStatus .. " (" .. Hub.ShopDone .. ")"
+				if s ~= Hub._LastShop then
+					Hub._LastShop = s
+					statShop:Append(s)
+				end
+			end)
+			task.wait(1)
+		end
+	end)
+	tabShop:CreateSlider({ name = T("Shop menzili"), range = { 100, 100000 }, increment = 100, value = Hub.ShopRange, suffix = "m", callback = function(v)
+		Hub.ShopRange = v
+	end })
+	local shopAddInput = tabShop:CreateInput({ name = T("Esya adi yaz"), placeholder = "Medkit", value = "" })
+	local function addShopToggle(nm)
+		if Hub.ShopToggles[nm] == nil then
+			if Hub.ShopOn[nm] == nil then
+				Hub.ShopOn[nm] = true
+			end
+			Hub.ShopToggles[nm] = tabShop:CreateToggle({ name = nm, flag = "s_" .. nm .. "_" .. tostring(math.floor(os.clock() * 100)), value = Hub.ShopOn[nm] ~= false, callback = function(v)
+				Hub.ShopOn[nm] = v
+			end })
+		end
+	end
+	tabShop:CreateButton({ name = T("Listeye ekle"), callback = function()
+		local nm = shopAddInput.value
+		if nm and nm ~= "" then
+			addShopToggle(nm)
+		end
+	end })
+	tabShop:CreateButton({ name = T("Shop esyalari tara"), callback = function()
+		local seen = {}
+		for _, it in ipairs(CollectionService:GetTagged("ShopItem")) do
+			seen[it.Name] = (seen[it.Name] or 0) + 1
+			addShopToggle(it.Name)
+		end
+		for k, c in pairs(seen) do
+			print("[SHOP]", k, "x" .. c)
+		end
+	end })
+	do
+		local spotMap, spotNames = buildSpots()
+		local selected = spotNames[1]
+		local dd
+		dd = tabShop:CreateDropdown({
+			name = T("Konum (Shop / Satis / Hurda)"),
+			options = spotNames,
+			value = selected,
+			flag = "ore_spot",
+			forgetState = true,
+			callback = function(sel)
+				selected = sel
+			end,
+		})
+		tabShop:CreateButton({ name = T("Secili konuma isinlan"), callback = function()
+			local e = spotMap[selected]
+			if e then
+				gotoSpot(e)
+			else
+				print("[SHOP] " .. T("konum yok"))
+			end
+		end })
+		tabShop:CreateButton({ name = T("Listeyi yenile"), callback = function()
+			spotMap, spotNames = buildSpots()
+			pcall(function()
+				dd:Refresh(spotNames)
+			end)
+			print("[SHOP] " .. #spotNames .. T(" konum"))
+		end })
+		task.spawn(function()
+			while alive() do
+				task.wait(10)
+				local m2, n2 = buildSpots()
+				if #n2 ~= #spotNames then
+					spotMap, spotNames = m2, n2
+					pcall(function()
+						dd:Refresh(n2)
+					end)
+				else
+					spotMap = m2
+				end
+			end
+		end)
+	end
+
+	-- ---------- Heal ----------
+	tabHeal:CreateToggle({ name = T("Oto heal"), value = Hub.HealAuto, callback = function(v)
+		Hub.HealAuto = v
+	end })
+	tabHeal:CreateToggle({ name = T("Kendimi de iyilestir"), value = Hub.SelfHeal, callback = function(v)
+		Hub.SelfHeal = v
+	end })
+	tabHeal:CreateToggle({ name = T("Medkit yoksa yerden al / shop'tan satin al"), value = Config.HealGet, callback = function(v)
+		Config.HealGet = v
+	end })
+	tabHeal:CreateSlider({ name = T("Can esigi"), range = { 10, 90 }, increment = 5, value = Hub.HealPct, suffix = "%", callback = function(v)
+		Hub.HealPct = v
+	end })
+	local statHeal = tabHeal:CreateConsole({ name = T("Durum"), follow = true, maxLines = 30 })
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				statHeal:Clear()
+				statHeal:Append(T("DURUM: ") .. Hub.HealStatus)
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p ~= LocalPlayer and p.Character then
+						local hum = p.Character:FindFirstChildOfClass("Humanoid")
+						if hum and hum.MaxHealth > 0 then
+							statHeal:Append(p.Name .. T(" CAN ") .. math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth))
+						end
+					end
+				end
+			end)
+			task.wait(3)
+		end
+	end)
+
+	-- ---------- Gear ----------
+	tabGear:CreateToggle({ name = T("En iyi esyayi bul + kusan"), value = Hub.GearAuto, callback = function(v)
+		Hub.GearAuto = v
+	end })
+	tabGear:CreateSlider({ name = T("Tarama menzili"), range = { 100, 100000 }, increment = 100, value = Hub.GearRange, suffix = "m", callback = function(v)
+		Hub.GearRange = v
+	end })
+	local statGear = tabGear:CreateConsole({ name = T("Durum"), follow = true, maxLines = 20 })
+	task.spawn(function()
+		while alive() do
+			pcall(function()
+				local s = Hub.GearBest .. " | " .. Hub.GearStatus
+				if s ~= Hub._LastGear then
+					Hub._LastGear = s
+					statGear:Append(s)
+				end
+			end)
+			task.wait(1)
+		end
+	end)
+	tabGear:CreateButton({ name = T("Daha iyi esyalari listele (top 15)"), callback = function()
+		local list = gearCandidates()
+		for i = 1, math.min(#list, 15) do
+			local e = list[i]
+			print(string.format("[GEAR %d] %s slot=%s skor=%d (elde=%s) %dm", i, e.it.Name, e.slot, e.s, tostring(e.cur), math.floor(e.d)))
+		end
+		if #list == 0 then
+			print(T("[GEAR] daha iyi esya yok"))
+		end
+	end })
+
+	-- ---------- Ayarlar ----------
+	tabSet:CreateDropdown({
+		name = T("Dil / Language"),
+		options = { "Türkçe", "English" },
+		value = (Lang == "en") and "English" or "Türkçe",
+		flag = "ore_lang",
+		forgetState = true,
+		callback = function(sel)
+			local nl = (sel == "English") and "en" or "tr"
+			if nl ~= Lang then
+				Lang = nl
+				saveSettings()
+				refreshMobile()
+				task.defer(function()
+					destroyUI()
+					buildUI()
+				end)
+			end
+		end,
+	})
+
+	-- Baslangic taramasi: shop + yakit filtrelerini doldur
+	task.spawn(function()
+		task.wait(4)
+		if not alive() then
+			return
+		end
+		for _, it in ipairs(CollectionService:GetTagged("ShopItem")) do
+			addShopToggle(it.Name)
+		end
+		local items = Workspace:FindFirstChild("Items")
+		if items then
+			for _, it in ipairs(items:GetChildren()) do
+				if isFuelItem(it) then
+					addFuelToggle(it.Name)
+				end
+			end
+		end
+	end)
+end
+
+buildUI()
+print("[OreFarm v6.2] yuklendi / loaded.")
